@@ -1,0 +1,19 @@
+.{
+    .name = .vszipcl,
+    .version = "0.0.1",
+    .fingerprint = 0x340b78a0968896e5,
+    .minimum_zig_version = "0.15.1",
+    .dependencies = .{
+        .vapoursynth = .{
+            // zig fetch --save git+https://github.com/dnjulek/vapoursynth-zig.git
+            .url = "git+https://github.com/dnjulek/vapoursynth-zig.git#deb29092bab5a9ef4ea736533a9fef8c7ab85228",
+            .hash = "vapoursynth-4.0.0-jLYMQ7GXAgDVp4MV4ruLzaL_cV-5d_OqTcbOSId5uPB8",
+        },
+        .opencl = .{
+            // zig fetch --save git+https://github.com/Snektron/opencl-zig.git
+            .url = "git+https://github.com/Snektron/opencl-zig.git#a5807beb62c84e72c6a976b5a589c862e2c12f12",
+            .hash = "opencl-0.1.0-W4Df3TKTAAC8QuJaPvbD9Q1tlKv7qzH9LTI3qYnoeU0i",
+        },
+    },
+    .paths = .{""},
+}

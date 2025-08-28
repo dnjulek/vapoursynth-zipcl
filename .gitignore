@@ -1,0 +1,11 @@
+zig-out/
+.zig-cache/
+.vscode/
+run.bat
+build-help/releases.json
+build-help/zig-*
+.vsjet/
+*.h
+*.cpp
+*.so
+build/
