@@ -1,5 +1,6 @@
 const std = @import("std");
 const vszipcl = @import("vszipcl.zig");
+const clpool = @import("clpool.zig");
 
 const cl = vszipcl.cl;
 const math = std.math;
@@ -14,17 +15,48 @@ const Data = struct {
     node: ?*vs.Node,
     vi: *const vs.VideoInfo,
 
+    context: cl.Context,
+    device: cl.Device,
+    program: cl.Program,
+    buff_size: usize,
+
+    blur_kernel: cl.Buffer(f32), // read-only weights, shared across streams
+    ksize: i32,
+
+    pool: clpool.Pool(Stream, Data),
+};
+
+/// Per-concurrent-frame OpenCL resources.
+const Stream = struct {
+    queue: cl.CommandQueue,
     src: cl.Buffer(f32),
     dst: cl.Buffer(f32),
     tmp: cl.Buffer(f32),
-    blur_kernel: cl.Buffer(f32),
-    ksize: i32,
-
-    context: cl.Context,
-    queue: cl.CommandQueue,
     vertical_blur: cl.Kernel,
     horizontal_blur: cl.Kernel,
-    program: cl.Program,
+
+    pub fn init(self: *Stream, d: *Data) !void {
+        self.queue = try cl.createCommandQueue(d.context, d.device, .{});
+        errdefer self.queue.release();
+        self.src = try cl.createBuffer(f32, d.context, .{ .read_only = true }, d.buff_size);
+        errdefer self.src.release();
+        self.dst = try cl.createBuffer(f32, d.context, .{ .read_write = true }, d.buff_size);
+        errdefer self.dst.release();
+        self.tmp = try cl.createBuffer(f32, d.context, .{ .read_write = true }, d.buff_size);
+        errdefer self.tmp.release();
+        self.vertical_blur = try cl.createKernel(d.program, "vertical_blur");
+        errdefer self.vertical_blur.release();
+        self.horizontal_blur = try cl.createKernel(d.program, "horizontal_blur");
+    }
+
+    pub fn deinit(self: *Stream) void {
+        self.horizontal_blur.release();
+        self.vertical_blur.release();
+        self.tmp.release();
+        self.dst.release();
+        self.src.release();
+        self.queue.release();
+    }
 };
 
 const vertical_blur =
@@ -47,20 +79,20 @@ const vertical_blur =
     \\        src_y = -src_y;
     \\        sum += src[src_y * stride + x] * blur_kernel[k];
     \\    }
-    \\    
+    \\
     \\    // Second loop: Handles the main body of the image where src_y is in-bounds.
     \\    for (int k = max(0, radius - y); k < min(kernel_len, h + radius - y); k++) {
     \\        const int src_y = y + k - radius;
     \\        sum += src[src_y * stride + x] * blur_kernel[k];
     \\    }
-    \\    
+    \\
     \\    // Third loop: Handles the bottom edge of the image where src_y >= h.
     \\    for (int k = max(0, h + radius - y); k < kernel_len; k++) {
     \\        int src_y = y + k - radius;
     \\        src_y = 2 * (h - 1) - src_y;
     \\        sum += src[src_y * stride + x] * blur_kernel[k];
     \\    }
-    \\    
+    \\
     \\    dst[y * stride + x] = sum;
     \\}
     \\
@@ -86,13 +118,13 @@ const horizontal_blur =
     \\        src_x = -src_x;
     \\        sum += src[y * stride + src_x] * blur_kernel[k];
     \\    }
-    \\    
+    \\
     \\    // Second loop: Handles the main body of the image where src_x is in-bounds.
     \\    for (int k = max(0, radius - x); k < min(kernel_len, w + radius - x); k++) {
     \\        const int src_x = x + k - radius;
     \\        sum += src[y * stride + src_x] * blur_kernel[k];
     \\    }
-    \\    
+    \\
     \\    // Third loop: Handles the right edge of the image where src_x >= w.
     \\    for (int k = max(0, w + radius - x); k < kernel_len; k++) {
     \\        int src_x = x + k - radius;
@@ -121,75 +153,59 @@ fn initOpenCL(d: *Data) !void {
         return error.NoDevices;
     }
 
-    const device = devices[0];
+    d.device = devices[0];
 
-    d.context = try cl.createContext(&.{device}, .{ .platform = platform });
-    d.queue = try cl.createCommandQueue(d.context, device, .{});
-
+    d.context = try cl.createContext(&.{d.device}, .{ .platform = platform });
     d.program = try cl.createProgramWithSource(d.context, vertical_blur ++ horizontal_blur);
-    d.program.build(&.{device}, "-cl-std=CL3.0") catch |err| {
+    d.program.build(&.{d.device}, "-cl-std=CL3.0") catch |err| {
         if (err == error.BuildProgramFailure) {
-            const log = try d.program.getBuildLog(allocator, device);
+            const log = try d.program.getBuildLog(allocator, d.device);
             defer allocator.free(log);
             std.log.err("OpenCL kernel build failed: {s}", .{log});
         }
         return err;
     };
-
-    // const platform_name = try platform.getName(allocator);
-    // const device_name = try device.getName(allocator);
-    // std.log.info("selected platform '{s}' and device '{s}'", .{ platform_name, device_name });
-
-    d.vertical_blur = try cl.createKernel(d.program, "vertical_blur");
-    d.horizontal_blur = try cl.createKernel(d.program, "horizontal_blur");
 }
 
-fn process(d: *Data, dstp: anytype, srcp: anytype, w: i32, h: i32, stride: i32) !void {
+fn process(d: *Data, s: *Stream, dstp: []f32, srcp: []const f32, w: i32, h: i32, stride: i32) !void {
     const local_work_size: [2]usize = .{ 16, 16 };
     const global_work_size: [2]usize = .{
         vsh.ceilN(@intCast(w), local_work_size[0]),
         vsh.ceilN(@intCast(h), local_work_size[1]),
     };
 
-    const whrite_complete = try d.queue.enqueueWriteBuffer(
-        f32,
-        d.src,
-        false,
-        0,
-        srcp,
-        &.{},
-    );
-    defer whrite_complete.release();
+    const write_complete = try s.queue.enqueueWriteBuffer(f32, s.src, false, 0, srcp, &.{});
+    defer write_complete.release();
 
     // Vertical pass: src -> tmp
-    try d.vertical_blur.setArg(@TypeOf(d.tmp), 0, d.tmp);
-    try d.vertical_blur.setArg(@TypeOf(d.src), 1, d.src);
-    try d.vertical_blur.setArg(@TypeOf(d.blur_kernel), 2, d.blur_kernel);
-    try d.vertical_blur.setArg(c_int, 3, d.ksize);
-    try d.vertical_blur.setArg(c_int, 4, w);
-    try d.vertical_blur.setArg(c_int, 5, h);
-    try d.vertical_blur.setArg(c_int, 6, stride);
+    try s.vertical_blur.setArg(@TypeOf(s.tmp), 0, s.tmp);
+    try s.vertical_blur.setArg(@TypeOf(s.src), 1, s.src);
+    try s.vertical_blur.setArg(@TypeOf(d.blur_kernel), 2, d.blur_kernel);
+    try s.vertical_blur.setArg(c_int, 3, d.ksize);
+    try s.vertical_blur.setArg(c_int, 4, w);
+    try s.vertical_blur.setArg(c_int, 5, h);
+    try s.vertical_blur.setArg(c_int, 6, stride);
 
-    const vertical_complete = try d.queue.enqueueNDRangeKernel(
-        d.vertical_blur,
+    const vertical_complete = try s.queue.enqueueNDRangeKernel(
+        s.vertical_blur,
         null,
         &global_work_size,
         &local_work_size,
-        &.{whrite_complete},
+        &.{write_complete},
     );
     defer vertical_complete.release();
 
     // Horizontal pass: tmp -> dst
-    try d.horizontal_blur.setArg(@TypeOf(d.dst), 0, d.dst);
-    try d.horizontal_blur.setArg(@TypeOf(d.tmp), 1, d.tmp);
-    try d.horizontal_blur.setArg(@TypeOf(d.blur_kernel), 2, d.blur_kernel);
-    try d.horizontal_blur.setArg(c_int, 3, d.ksize);
-    try d.horizontal_blur.setArg(c_int, 4, w);
-    try d.horizontal_blur.setArg(c_int, 5, h);
-    try d.horizontal_blur.setArg(c_int, 6, stride);
+    try s.horizontal_blur.setArg(@TypeOf(s.dst), 0, s.dst);
+    try s.horizontal_blur.setArg(@TypeOf(s.tmp), 1, s.tmp);
+    try s.horizontal_blur.setArg(@TypeOf(d.blur_kernel), 2, d.blur_kernel);
+    try s.horizontal_blur.setArg(c_int, 3, d.ksize);
+    try s.horizontal_blur.setArg(c_int, 4, w);
+    try s.horizontal_blur.setArg(c_int, 5, h);
+    try s.horizontal_blur.setArg(c_int, 6, stride);
 
-    const horizontal_complete = try d.queue.enqueueNDRangeKernel(
-        d.horizontal_blur,
+    const horizontal_complete = try s.queue.enqueueNDRangeKernel(
+        s.horizontal_blur,
         null,
         &global_work_size,
         &local_work_size,
@@ -197,14 +213,10 @@ fn process(d: *Data, dstp: anytype, srcp: anytype, w: i32, h: i32, stride: i32) 
     );
     defer horizontal_complete.release();
 
-    const read_complete = try d.queue.enqueueReadBuffer(
-        f32,
-        d.dst,
-        false,
-        0,
-        dstp,
-        &.{horizontal_complete},
-    );
+    // The separable kernels leave this read off PoCL-CUDA's fast DMA path, but
+    // running several streams concurrently (see the pool size in create) lets
+    // these slower reads overlap across frames, which recovers throughput.
+    const read_complete = try s.queue.enqueueReadBuffer(f32, s.dst, false, 0, dstp, &.{horizontal_complete});
     defer read_complete.release();
 
     try cl.waitForEvents(&.{read_complete});
@@ -221,6 +233,9 @@ fn getFrame(n: c_int, activation_reason: vs.ActivationReason, instance_data: ?*a
         defer src.deinit();
         const dst = src.newVideoFrame();
 
+        const s = d.pool.acquire();
+        defer d.pool.release(s);
+
         var plane: u32 = 0;
         while (plane < d.vi.format.numPlanes) : (plane += 1) {
             const srcp = src.getReadSlice2(f32, plane);
@@ -230,7 +245,7 @@ fn getFrame(n: c_int, activation_reason: vs.ActivationReason, instance_data: ?*a
             const h = src.getHeightSigned(plane);
             const stride = src.getStride2(f32, plane);
 
-            process(d, dstp, srcp, w, h, @intCast(stride)) catch |err| {
+            process(d, s, dstp, srcp, w, h, @intCast(stride)) catch |err| {
                 zapi.setFilterError("GaussBlur: process frame failed.");
                 std.log.err("OpenCL process frame failed: {}", .{err});
                 dst.deinit();
@@ -247,14 +262,9 @@ fn getFrame(n: c_int, activation_reason: vs.ActivationReason, instance_data: ?*a
 fn free(instance_data: ?*anyopaque, _: ?*vs.Core, vsapi: ?*const vs.API) callconv(.c) void {
     const d: *Data = @ptrCast(@alignCast(instance_data));
 
-    d.src.release();
-    d.dst.release();
-    d.tmp.release();
+    d.pool.deinit();
     d.blur_kernel.release();
-    d.vertical_blur.release();
-    d.horizontal_blur.release();
     d.program.release();
-    d.queue.release();
     d.context.release();
 
     vsapi.?.freeNode.?(d.node);
@@ -286,26 +296,7 @@ pub fn create(in: ?*const vs.Map, out: ?*vs.Map, _: ?*anyopaque, core: ?*vs.Core
     pad_size = @divTrunc(@min(pad_size, 64), @as(u32, @intCast(d.vi.format.bytesPerSample)));
     const stride: usize = vsh.ceilN(@intCast(d.vi.width), pad_size);
     const height: usize = @intCast(d.vi.height);
-
-    const buff_size: usize = stride * height;
-    d.src = cl.createBuffer(f32, d.context, .{ .read_only = true }, buff_size) catch |err| {
-        map_out.setError("GaussBlur: cl.createBuffer failed.");
-        std.log.err("OpenCL cl.createBuffer failed: {}", .{err});
-        zapi.freeNode(d.node);
-        return;
-    };
-    d.dst = cl.createBuffer(f32, d.context, .{ .read_write = true }, buff_size) catch |err| {
-        map_out.setError("GaussBlur: cl.createBuffer failed.");
-        std.log.err("OpenCL cl.createBuffer failed: {}", .{err});
-        zapi.freeNode(d.node);
-        return;
-    };
-    d.tmp = cl.createBuffer(f32, d.context, .{ .read_write = true }, buff_size) catch |err| {
-        map_out.setError("GaussBlur: cl.createBuffer failed.");
-        std.log.err("OpenCL cl.createBuffer failed: {}", .{err});
-        zapi.freeNode(d.node);
-        return;
-    };
+    d.buff_size = stride * height;
 
     const sigma = map_in.getValue(f32, "sigma") orelse 0.5;
     const blur_kernel = getGaussKernel(sigma) catch unreachable;
@@ -313,8 +304,30 @@ pub fn create(in: ?*const vs.Map, out: ?*vs.Map, _: ?*anyopaque, core: ?*vs.Core
     d.ksize = @intCast(blur_kernel.len);
     d.blur_kernel = cl.createBufferWithData(f32, d.context, .{ .read_only = true }, blur_kernel) catch unreachable;
 
+    d.pool = .{};
+
     const data: *Data = allocator.create(Data) catch unreachable;
     data.* = d;
+
+    // The separable read is slow on PoCL-CUDA; running a few frames concurrently
+    // lets those reads overlap. ~4 streams is the measured sweet spot (more adds
+    // contention), capped by the core thread count.
+    var info: vs.CoreInfo = .{};
+    zapi.getCoreInfo(core, &info);
+    const threads: usize = if (info.numThreads > 0) @intCast(info.numThreads) else 1;
+    const streams: usize = @min(max_streams, threads);
+    data.pool.prime(data, streams);
+    data.pool.prewarm(streams) catch |err| {
+        map_out.setError("GaussBlur: OpenCL stream init failed.");
+        std.log.err("OpenCL stream init failed: {}", .{err});
+        data.pool.deinit();
+        data.blur_kernel.release();
+        data.program.release();
+        data.context.release();
+        zapi.freeNode(d.node);
+        allocator.destroy(data);
+        return;
+    };
 
     var dep = [_]vs.FilterDependency{
         .{ .source = d.node, .requestPattern = .StrictSpatial },
@@ -322,6 +335,8 @@ pub fn create(in: ?*const vs.Map, out: ?*vs.Map, _: ?*anyopaque, core: ?*vs.Core
 
     zapi.createVideoFilter(out, "GaussBlur", d.vi, getFrame, free, .Unordered, &dep, data);
 }
+
+const max_streams: usize = 4;
 
 fn getGaussKernel(sigma: f32) ![]f32 {
     var taps: usize = @intFromFloat(@ceil(sigma * 6 + 1));

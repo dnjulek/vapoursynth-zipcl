@@ -27,7 +27,7 @@ pub fn build(b: *std.Build) !void {
     });
 
     if (os == .windows) {
-        lib.addLibraryPath(.{ .cwd_relative = "C:/WINDOWS/system32" });
+        lib.root_module.addLibraryPath(.{ .cwd_relative = "C:/WINDOWS/system32" });
     }
 
     const vapoursynth_dep = b.dependency("vapoursynth", .{
@@ -42,7 +42,7 @@ pub fn build(b: *std.Build) !void {
 
     lib.root_module.addImport("opencl", opencl);
     lib.root_module.addImport("vapoursynth", vapoursynth_dep);
-    lib.linkLibC();
+    lib.root_module.link_libc = true;
 
     if (lib.root_module.optimize == .ReleaseFast) {
         lib.root_module.strip = true;

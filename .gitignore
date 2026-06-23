@@ -9,3 +9,4 @@ build-help/zig-*
 *.cpp
 *.so
 build/
+zig-pkg/

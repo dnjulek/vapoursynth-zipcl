@@ -1,5 +1,6 @@
 const std = @import("std");
 const vszipcl = @import("vszipcl.zig");
+const clpool = @import("clpool.zig");
 
 const cl = vszipcl.cl;
 const math = std.math;
@@ -18,13 +19,38 @@ const Data = struct {
     sigma_color: f32,
     radius: i32,
 
+    context: cl.Context,
+    device: cl.Device,
+    program: cl.Program,
+    buff_size: usize,
+
+    pool: clpool.Pool(Stream, Data),
+};
+
+/// Per-concurrent-frame OpenCL resources. One is acquired per getFrame call so
+/// frames never share a queue, buffers or kernel.
+const Stream = struct {
+    queue: cl.CommandQueue,
     src: cl.Buffer(f32),
     dst: cl.Buffer(f32),
+    kernel: cl.Kernel,
 
-    context: cl.Context,
-    queue: cl.CommandQueue,
-    bilateral: cl.Kernel,
-    program: cl.Program,
+    pub fn init(self: *Stream, d: *Data) !void {
+        self.queue = try cl.createCommandQueue(d.context, d.device, .{});
+        errdefer self.queue.release();
+        self.src = try cl.createBuffer(f32, d.context, .{ .read_only = true }, d.buff_size);
+        errdefer self.src.release();
+        self.dst = try cl.createBuffer(f32, d.context, .{ .read_write = true }, d.buff_size);
+        errdefer self.dst.release();
+        self.kernel = try cl.createKernel(d.program, "bilateral");
+    }
+
+    pub fn deinit(self: *Stream) void {
+        self.kernel.release();
+        self.dst.release();
+        self.src.release();
+        self.queue.release();
+    }
 };
 
 const bilateral =
@@ -78,71 +104,51 @@ fn initOpenCL(d: *Data) !void {
         return error.NoDevices;
     }
 
-    const device = devices[0];
+    d.device = devices[0];
 
-    d.context = try cl.createContext(&.{device}, .{ .platform = platform });
-    d.queue = try cl.createCommandQueue(d.context, device, .{});
-
+    d.context = try cl.createContext(&.{d.device}, .{ .platform = platform });
     d.program = try cl.createProgramWithSource(d.context, bilateral);
-    d.program.build(&.{device}, "-cl-std=CL3.0") catch |err| {
+    d.program.build(&.{d.device}, "-cl-std=CL3.0") catch |err| {
         if (err == error.BuildProgramFailure) {
-            const log = try d.program.getBuildLog(allocator, device);
+            const log = try d.program.getBuildLog(allocator, d.device);
             defer allocator.free(log);
             std.log.err("OpenCL kernel build failed: {s}", .{log});
         }
         return err;
     };
-
-    // const platform_name = try platform.getName(allocator);
-    // const device_name = try device.getName(allocator);
-    // std.log.info("selected platform '{s}' and device '{s}'", .{ platform_name, device_name });
-
-    d.bilateral = try cl.createKernel(d.program, "bilateral");
 }
 
-fn process(d: *Data, dstp: anytype, srcp: anytype, w: i32, h: i32, stride: i32) !void {
+fn process(d: *Data, s: *Stream, dstp: []f32, srcp: []const f32, w: i32, h: i32, stride: i32) !void {
     const local_work_size: [2]usize = .{ 16, 16 };
     const global_work_size: [2]usize = .{
         vsh.ceilN(@intCast(w), local_work_size[0]),
         vsh.ceilN(@intCast(h), local_work_size[1]),
     };
 
-    const whrite_complete = try d.queue.enqueueWriteBuffer(
-        f32,
-        d.src,
-        false,
-        0,
-        srcp,
-        &.{},
-    );
-    defer whrite_complete.release();
+    const write_complete = try s.queue.enqueueWriteBuffer(f32, s.src, false, 0, srcp, &.{});
+    defer write_complete.release();
 
-    try d.bilateral.setArg(@TypeOf(d.dst), 0, d.dst);
-    try d.bilateral.setArg(@TypeOf(d.src), 1, d.src);
-    try d.bilateral.setArg(c_int, 2, w);
-    try d.bilateral.setArg(c_int, 3, h);
-    try d.bilateral.setArg(c_int, 4, @intCast(stride));
-    try d.bilateral.setArg(f32, 5, d.sigma_spatial);
-    try d.bilateral.setArg(f32, 6, d.sigma_color);
-    try d.bilateral.setArg(c_int, 7, d.radius);
+    try s.kernel.setArg(@TypeOf(s.dst), 0, s.dst);
+    try s.kernel.setArg(@TypeOf(s.src), 1, s.src);
+    try s.kernel.setArg(c_int, 2, w);
+    try s.kernel.setArg(c_int, 3, h);
+    try s.kernel.setArg(c_int, 4, @intCast(stride));
+    try s.kernel.setArg(f32, 5, d.sigma_spatial);
+    try s.kernel.setArg(f32, 6, d.sigma_color);
+    try s.kernel.setArg(c_int, 7, d.radius);
 
-    const bilateral_complete = try d.queue.enqueueNDRangeKernel(
-        d.bilateral,
+    const kernel_complete = try s.queue.enqueueNDRangeKernel(
+        s.kernel,
         null,
         &global_work_size,
         &local_work_size,
-        &.{whrite_complete},
+        &.{write_complete},
     );
-    defer bilateral_complete.release();
+    defer kernel_complete.release();
 
-    const read_complete = try d.queue.enqueueReadBuffer(
-        f32,
-        d.dst,
-        false,
-        0,
-        dstp,
-        &.{bilateral_complete},
-    );
+    // The bilateral kernel keeps the D2H read on PoCL-CUDA's fast path, so we
+    // read straight into the VS frame (no pinned staging buffer / extra memcpy).
+    const read_complete = try s.queue.enqueueReadBuffer(f32, s.dst, false, 0, dstp, &.{kernel_complete});
     defer read_complete.release();
 
     try cl.waitForEvents(&.{read_complete});
@@ -159,6 +165,9 @@ fn getFrame(n: c_int, activation_reason: vs.ActivationReason, instance_data: ?*a
         defer src.deinit();
         const dst = src.newVideoFrame();
 
+        const s = d.pool.acquire();
+        defer d.pool.release(s);
+
         var plane: u32 = 0;
         while (plane < d.vi.format.numPlanes) : (plane += 1) {
             const srcp = src.getReadSlice2(f32, plane);
@@ -168,7 +177,7 @@ fn getFrame(n: c_int, activation_reason: vs.ActivationReason, instance_data: ?*a
             const h = src.getHeightSigned(plane);
             const stride = src.getStride2(f32, plane);
 
-            process(d, dstp, srcp, w, h, @intCast(stride)) catch |err| {
+            process(d, s, dstp, srcp, w, h, @intCast(stride)) catch |err| {
                 zapi.setFilterError("Bilateral: process frame failed.");
                 std.log.err("OpenCL process frame failed: {}", .{err});
                 dst.deinit();
@@ -185,11 +194,8 @@ fn getFrame(n: c_int, activation_reason: vs.ActivationReason, instance_data: ?*a
 fn free(instance_data: ?*anyopaque, _: ?*vs.Core, vsapi: ?*const vs.API) callconv(.c) void {
     const d: *Data = @ptrCast(@alignCast(instance_data));
 
-    d.src.release();
-    d.dst.release();
-    d.bilateral.release();
+    d.pool.deinit();
     d.program.release();
-    d.queue.release();
     d.context.release();
 
     vsapi.?.freeNode.?(d.node);
@@ -228,23 +234,31 @@ pub fn create(in: ?*const vs.Map, out: ?*vs.Map, _: ?*anyopaque, core: ?*vs.Core
     pad_size = @divTrunc(@min(pad_size, 64), @as(u32, @intCast(d.vi.format.bytesPerSample)));
     const stride: usize = vsh.ceilN(@intCast(d.vi.width), pad_size);
     const height: usize = @intCast(d.vi.height);
+    d.buff_size = stride * height;
 
-    const buff_size: usize = stride * height;
-    d.src = cl.createBuffer(f32, d.context, .{ .read_only = true }, buff_size) catch |err| {
-        map_out.setError("Bilateral: cl.createBuffer failed.");
-        std.log.err("OpenCL cl.createBuffer failed: {}", .{err});
-        zapi.freeNode(d.node);
-        return;
-    };
-    d.dst = cl.createBuffer(f32, d.context, .{ .read_write = true }, buff_size) catch |err| {
-        map_out.setError("Bilateral: cl.createBuffer failed.");
-        std.log.err("OpenCL cl.createBuffer failed: {}", .{err});
-        zapi.freeNode(d.node);
-        return;
-    };
+    d.pool = .{};
 
     const data: *Data = allocator.create(Data) catch unreachable;
     data.* = d;
+
+    var info: vs.CoreInfo = .{};
+    zapi.getCoreInfo(core, &info);
+    const threads: usize = if (info.numThreads > 0) @intCast(info.numThreads) else 1;
+    // Run a few frames concurrently so their host<->device transfers overlap.
+    // ~4 streams is the measured sweet spot on PoCL-CUDA (more adds contention),
+    // capped by the core thread count so low-thread cores don't over-allocate.
+    const streams: usize = @min(max_streams, threads);
+    data.pool.prime(data, streams);
+    data.pool.prewarm(streams) catch |err| {
+        map_out.setError("Bilateral: OpenCL stream init failed.");
+        std.log.err("OpenCL stream init failed: {}", .{err});
+        data.pool.deinit();
+        data.program.release();
+        data.context.release();
+        zapi.freeNode(d.node);
+        allocator.destroy(data);
+        return;
+    };
 
     var dep = [_]vs.FilterDependency{
         .{ .source = d.node, .requestPattern = .StrictSpatial },
@@ -252,3 +266,5 @@ pub fn create(in: ?*const vs.Map, out: ?*vs.Map, _: ?*anyopaque, core: ?*vs.Core
 
     zapi.createVideoFilter(out, "Bilateral", d.vi, getFrame, free, .Unordered, &dep, data);
 }
+
+const max_streams: usize = 4;
