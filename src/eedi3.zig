@@ -283,27 +283,23 @@ const kernel_src =
     \\    }
     \\}
     \\
-    \\// Parallel vCheck. Reads the interp result `dst` (a snapshot — every row sees
-    \\// the un-vchecked ±2 neighbours, unlike the CPU's sequential feedback) and
-    \\// writes the smoothed frame to `out`. global = (w, dst_h); kept rows and
-    \\// non-vcheckable interp rows pass through unchanged.
+    \\// Sequential vCheck, one launch per interpolated row (`off`) in increasing
+    \\// order. d2p (row 2 above = the previous interpolated row) is read from the
+    \\// OUTPUT buffer `out`, which already holds that row's vchecked result — this
+    \\// reproduces the CPU's in-place ±2 feedback exactly. Every other neighbour
+    \\// comes from the interp snapshot `dst`. global = (w,). The host seeds `out`
+    \\// with a copy of `dst` so kept + non-vcheckable rows pass through unchanged.
     \\kernel void vcheck(global float *out, global const float *dst, global const float *src,
     \\                   global const int *rowidx, global const int *dmap, global const float *scp,
     \\                   const int w, const int stride, const int dst_h, const int field,
-    \\                   const int n_interp, const int vmode, const int use_scp, const int hp,
+    \\                   const int n_interp, const int off, const int vmode, const int use_scp, const int hp,
     \\                   const float rcp0, const float rcp1, const float rcp2, const float vthresh2) {
     \\    const int x = get_global_id(0);
-    \\    const int y = get_global_id(1);
-    \\    if (x >= w || y >= dst_h) return;
-    \\    const int is_interp = ((y & 1) == field);
-    \\    const int off = (y - field) >> 1;
-    \\    if (!is_interp || off < 1 || off >= n_interp - 1 || y < 2 || y + 2 >= dst_h) {
-    \\        out[y*stride + x] = dst[y*stride + x];
-    \\        return;
-    \\    }
+    \\    if (x >= w) return;
+    \\    const int y = field + 2*off;
     \\    global const float *drow = dst + y*stride;
     \\    global const float *d1p = dst + (y-1)*stride;
-    \\    global const float *d2p = dst + (y-2)*stride;
+    \\    global const float *d2p = out + (y-2)*stride;
     \\    global const float *d1n = dst + (y+1)*stride;
     \\    global const float *d2n = dst + (y+2)*stride;
     \\    global const float *d3p = src + rowidx[off*4+0]*stride;
@@ -626,6 +622,13 @@ fn process(d: *Data, s: *Stream, dstp: []f32, srcp: []const f32, scpp: ?[]const 
             break :blk 1;
         } else 0;
 
+        // Seed the output buffer with the interp snapshot so kept rows and
+        // non-vcheckable interp rows pass through, and so each row's d2p (the
+        // previous interp row) reads a valid value before it is overwritten.
+        if (cl.c.clEnqueueCopyBuffer(s.queue.handle, s.d_dst.handle, s.d_dst2.handle, 0, 0, d.stride * d.dst_h * @sizeOf(f32), 0, null, null) != cl.c.CL_SUCCESS) {
+            return error.EnqueueCopyBuffer;
+        }
+
         try s.k_vcheck.setArg(@TypeOf(s.d_dst2), 0, s.d_dst2);
         try s.k_vcheck.setArg(@TypeOf(s.d_dst), 1, s.d_dst);
         try s.k_vcheck.setArg(@TypeOf(s.d_src), 2, s.d_src);
@@ -637,16 +640,27 @@ fn process(d: *Data, s: *Stream, dstp: []f32, srcp: []const f32, scpp: ?[]const 
         try s.k_vcheck.setArg(c_int, 8, @intCast(d.dst_h));
         try s.k_vcheck.setArg(c_int, 9, field);
         try s.k_vcheck.setArg(c_int, 10, @intCast(d.n_interp));
-        try s.k_vcheck.setArg(c_int, 11, @intCast(d.vcheck));
-        try s.k_vcheck.setArg(c_int, 12, use_scp);
-        try s.k_vcheck.setArg(c_int, 13, @intFromBool(d.hp));
-        try s.k_vcheck.setArg(f32, 14, d.rcp0);
-        try s.k_vcheck.setArg(f32, 15, d.rcp1);
-        try s.k_vcheck.setArg(f32, 16, d.rcp2);
-        try s.k_vcheck.setArg(f32, 17, d.vthresh2);
-        const vc_gws: [2]usize = .{ vsh.ceilN(@intCast(w), 16), d.dst_h };
-        const vc_lws: [2]usize = .{ 16, 1 };
-        (try s.queue.enqueueNDRangeKernel(s.k_vcheck, null, &vc_gws, &vc_lws, none)).release();
+        // arg 11 (off) is set per interpolated row in the loop below.
+        try s.k_vcheck.setArg(c_int, 12, @intCast(d.vcheck));
+        try s.k_vcheck.setArg(c_int, 13, use_scp);
+        try s.k_vcheck.setArg(c_int, 14, @intFromBool(d.hp));
+        try s.k_vcheck.setArg(f32, 15, d.rcp0);
+        try s.k_vcheck.setArg(f32, 16, d.rcp1);
+        try s.k_vcheck.setArg(f32, 17, d.rcp2);
+        try s.k_vcheck.setArg(f32, 18, d.vthresh2);
+
+        // Row `off` reads the vchecked result of row `off-1` (d2p), so the
+        // launches must run sequentially. The in-order queue guarantees that.
+        const vc_gws: [1]usize = .{vsh.ceilN(@intCast(w), 64)};
+        const vc_lws: [1]usize = .{64};
+        const dst_h_i: i32 = @intCast(d.dst_h);
+        var voff: u32 = 1;
+        while (voff + 1 < d.n_interp) : (voff += 1) {
+            const y: i32 = @as(i32, field) + 2 * @as(i32, @intCast(voff));
+            if (y < 2 or y + 2 >= dst_h_i) continue;
+            try s.k_vcheck.setArg(c_int, 11, @intCast(voff));
+            (try s.queue.enqueueNDRangeKernel(s.k_vcheck, null, &vc_gws, &vc_lws, none)).release();
+        }
         result = s.d_dst2;
     }
 
