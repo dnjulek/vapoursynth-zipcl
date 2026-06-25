@@ -17,6 +17,10 @@ const tpitch_max = 2 * mdis_max + 1; // 81
 const kernel_src =
     \\#define TPMAX 83  /* tpitch_max + 2 sentinels */
     \\#define FLTMAX9 3.0e38f
+    \\#ifndef CN
+    \\#define CN 2      /* = nrad; overridden by -DCN=<nrad> at build time so the
+    \\                     hot cost loop has a compile-time bound and fully unrolls */
+    \\#endif
     \\
     \\// mirror-reflect a horizontal index into [0,w) (fractional axis, no edge dup)
     \\static int refl(int i, const int w) {
@@ -42,15 +46,16 @@ const kernel_src =
     \\
     \\// connection cost for output position x, direction u (matches interpLine).
     \\// Row pointers are PADDED rows; index [idx+pad] with no per-access refl().
-    \\static float conn_cost(global const float *r3p, global const float *r1p,
-    \\                       global const float *r1n, global const float *r3n,
+    \\static float conn_cost(global const float * restrict r3p, global const float * restrict r1p,
+    \\                       global const float * restrict r1n, global const float * restrict r3n,
     \\                       const int x, const int u, const int w, const int nrad,
     \\                       const int pad,
     \\                       const float alpha, const float beta, const float one_minus_ab) {
     \\    const int two_u = 2*u;
     \\    const int xp = x + pad;            // x mapped into the padded row
     \\    float sw = 0.0f;
-    \\    for (int k = -nrad; k <= nrad; k++) {
+    \\    #pragma unroll
+    \\    for (int k = -CN; k <= CN; k++) {
     \\        int a0 = xp + u + k,    b0 = a0 - two_u;
     \\        int a1 = xp + k,        b1 = a1 - two_u;
     \\        int a2 = xp + two_u + k, b2 = a2 - two_u;
@@ -86,9 +91,9 @@ const kernel_src =
     \\// One workgroup per interpolated row. local_size = padded tpitch.
     \\// rowidx[off*4 + {0,1,2,3}] = src y-index for r3p,r1p,r1n,r3n.
     \\// dst_y[off] = destination row.  fpath is dynamic local (w ints).
-    \\kernel void interp(global float *dst, global const float *srcpad,
-    \\                   global const int *rowidx, global const int *dst_y,
-    \\                   global char *pbackt, global int *dmap,
+    \\kernel void interp(global float * restrict dst, global const float * restrict srcpad,
+    \\                   global const int * restrict rowidx, global const int * restrict dst_y,
+    \\                   global char * restrict pbackt, global int * restrict dmap,
     \\                   const int w, const int stride, const int pstride, const int pad,
     \\                   const int mdis, const int nrad,
     \\                   const float alpha, const float beta, const float gamma,
@@ -100,10 +105,10 @@ const kernel_src =
     \\    const int tpitch = 2*mdis + 1;
     \\
     \\    // PADDED rows: index [j+pad] for any j in [-pad, w-1+pad], no refl().
-    \\    global const float *r3p = srcpad + rowidx[off*4+0]*pstride;
-    \\    global const float *r1p = srcpad + rowidx[off*4+1]*pstride;
-    \\    global const float *r1n = srcpad + rowidx[off*4+2]*pstride;
-    \\    global const float *r3n = srcpad + rowidx[off*4+3]*pstride;
+    \\    global const float * restrict r3p = srcpad + rowidx[off*4+0]*pstride;
+    \\    global const float * restrict r1p = srcpad + rowidx[off*4+1]*pstride;
+    \\    global const float * restrict r1n = srcpad + rowidx[off*4+2]*pstride;
+    \\    global const float * restrict r3n = srcpad + rowidx[off*4+3]*pstride;
     \\    global char *pb = pbackt + (long)off * w * tpitch;
     \\
     \\    local float pc[2][TPMAX];
@@ -169,20 +174,21 @@ const kernel_src =
     \\#define TPMAX_HP 165   /* 4*mdis_max+1 + 4 sentinels */
     \\// Rows passed to the hp helpers are PADDED rows already advanced by `pad`, so
     \\// R(row,j) is a plain row[j] (j may be negative / >= w within the pad margin).
-    \\static float R(global const float *row, int j) { return row[j]; }
+    \\static float R(global const float * restrict row, int j) { return row[j]; }
     \\// cubic half-pel sample between full-pel j and j+1 (matches computeHpRow)
-    \\static float HP(global const float *row, int j) {
+    \\static float HP(global const float * restrict row, int j) {
     \\    return 0.5625f*(row[j]+row[j+1]) - 0.0625f*(row[j-1]+row[j+2]);
     \\}
-    \\static float conn_cost_hp(global const float *r3p, global const float *r1p,
-    \\                          global const float *r1n, global const float *r3n,
+    \\static float conn_cost_hp(global const float * restrict r3p, global const float * restrict r1p,
+    \\                          global const float * restrict r1n, global const float * restrict r3n,
     \\                          const int x, const int u, const int w, const int nrad,
     \\                          const float alpha3, const float beta255, const float one_minus_ab) {
     \\    const int uh = u >> 1;
     \\    const int odd = u & 1;
     \\    const int lo0 = odd ? (-uh - 1) : (-uh);
     \\    float s0=0.0f, s1=0.0f, s2=0.0f;
-    \\    for (int k=-nrad; k<=nrad; k++) {
+    \\    #pragma unroll
+    \\    for (int k=-CN; k<=CN; k++) {
     \\        int xk = x+k, hi = x+uh+k, lo = x+lo0+k, xu = x+u+k, xmu = x-u+k;
     \\        s1 += fabs(R(r3p,xk)-R(r1p,xmu)) + fabs(R(r1p,xk)-R(r1n,xmu)) + fabs(R(r1n,xk)-R(r3n,xmu));
     \\        s2 += fabs(R(r3p,xu)-R(r1p,xk)) + fabs(R(r1p,xu)-R(r1n,xk)) + fabs(R(r1n,xu)-R(r3n,xk));
@@ -198,9 +204,9 @@ const kernel_src =
     \\    return alpha3*(s0+s1+s2) + beta255*(float)abs(u)*0.5f + one_minus_ab*v;
     \\}
     \\
-    \\kernel void interp_hp(global float *dst, global const float *srcpad,
-    \\                      global const int *rowidx, global const int *dst_y,
-    \\                      global char *pbackt, global int *dmap,
+    \\kernel void interp_hp(global float * restrict dst, global const float * restrict srcpad,
+    \\                      global const int * restrict rowidx, global const int * restrict dst_y,
+    \\                      global char * restrict pbackt, global int * restrict dmap,
     \\                      const int w, const int stride, const int pstride, const int pad,
     \\                      const int mdis, const int nrad,
     \\                      const float alpha3, const float beta255, const float gamma255,
@@ -211,10 +217,10 @@ const kernel_src =
     \\    const int cen = 2*mdis;
     \\    const int tpitch = 4*mdis + 1;
     \\    // PADDED rows, pre-advanced by `pad` so R(row,j)=row[j] needs no refl().
-    \\    global const float *r3p = srcpad + rowidx[off*4+0]*pstride + pad;
-    \\    global const float *r1p = srcpad + rowidx[off*4+1]*pstride + pad;
-    \\    global const float *r1n = srcpad + rowidx[off*4+2]*pstride + pad;
-    \\    global const float *r3n = srcpad + rowidx[off*4+3]*pstride + pad;
+    \\    global const float * restrict r3p = srcpad + rowidx[off*4+0]*pstride + pad;
+    \\    global const float * restrict r1p = srcpad + rowidx[off*4+1]*pstride + pad;
+    \\    global const float * restrict r1n = srcpad + rowidx[off*4+2]*pstride + pad;
+    \\    global const float * restrict r3n = srcpad + rowidx[off*4+3]*pstride + pad;
     \\    global char *pb = pbackt + (long)off * w * tpitch;
     \\    local float pc[2][TPMAX_HP];
     \\    const int u = tid - cen;
@@ -283,67 +289,81 @@ const kernel_src =
     \\    }
     \\}
     \\
-    \\// Sequential vCheck, one launch per interpolated row (`off`) in increasing
-    \\// order. d2p (row 2 above = the previous interpolated row) is read from the
-    \\// OUTPUT buffer `out`, which already holds that row's vchecked result — this
-    \\// reproduces the CPU's in-place ±2 feedback exactly. Every other neighbour
-    \\// comes from the interp snapshot `dst`. global = (w,). The host seeds `out`
-    \\// with a copy of `dst` so kept + non-vcheckable rows pass through unchanged.
+    \\// Sequential vCheck in ONE launch: a single workgroup loops over the
+    \\// interpolated rows (`off`) in increasing order, barrier()-ing between rows.
+    \\// d2p (row 2 above = the previous interpolated row) is read from the OUTPUT
+    \\// buffer `out`, which by the barrier already holds that row's vchecked
+    \\// result — reproducing the CPU's in-place ±2 feedback exactly, and bit-exact
+    \\// despite the horizontal ±dir coupling (d2p is read at x±offh) because the
+    \\// whole prior row is finished before the barrier. The just-written prior row
+    \\// stays L2-hot, so reading d2p from global is as fast as a local copy would
+    \\// be (shared-mem staging of it was benchmarked and was flat-to-worse). Every
+    \\// other neighbour comes from the interp snapshot `dst`. Launch global = local
+    \\// = one workgroup; work-items grid-stride over x within each row. The host
+    \\// seeds `out` (= copy of `dst`) so kept + non-vcheckable rows pass through,
+    \\// and so the first row's d2p reads a valid (off=0 interp) row.
     \\kernel void vcheck(global float *out, global const float *dst, global const float *src,
     \\                   global const int *rowidx, global const int *dmap, global const float *scp,
     \\                   const int w, const int stride, const int dst_h, const int field,
-    \\                   const int n_interp, const int off, const int vmode, const int use_scp, const int hp,
+    \\                   const int n_interp, const int vmode, const int use_scp, const int hp,
     \\                   const float rcp0, const float rcp1, const float rcp2, const float vthresh2) {
-    \\    const int x = get_global_id(0);
-    \\    if (x >= w) return;
-    \\    const int y = field + 2*off;
-    \\    global const float *drow = dst + y*stride;
-    \\    global const float *d1p = dst + (y-1)*stride;
-    \\    global const float *d2p = out + (y-2)*stride;
-    \\    global const float *d1n = dst + (y+1)*stride;
-    \\    global const float *d2n = dst + (y+2)*stride;
-    \\    global const float *d3p = src + rowidx[off*4+0]*stride;
-    \\    global const float *d3n = src + rowidx[off*4+3]*stride;
-    \\    const int dirc = dmap[(long)off*stride + x];
-    \\    float cint = use_scp ? scp[y*stride + x] : (0.5625f*(d1p[x]+d1n[x]) - 0.0625f*(d3p[x]+d3n[x]));
-    \\    int dirt = dmap[(long)(off-1)*stride + x];
-    \\    int dirb = dmap[(long)(off+1)*stride + x];
-    \\    int maxoff = hp ? ((dirc & 1) == 0 ? abs(dirc>>1) : max(abs(dirc>>1), abs((dirc+1)>>1))) : abs(dirc);
-    \\    if (dirc == 0 || max(dirc*dirt, dirc*dirb) < 0 || (dirt==dirb && dirt==0)
-    \\        || x + maxoff >= w || x - maxoff < 0) {
-    \\        out[y*stride + x] = cint;
-    \\        return;
+    \\    const int lid = get_local_id(0);
+    \\    const int lsz = get_local_size(0);
+    \\    for (int off = 1; off + 1 < n_interp; ++off) {
+    \\        const int y = field + 2*off;
+    \\        if (y >= 2 && y + 2 < dst_h) {
+    \\            global const float *drow = dst + y*stride;
+    \\            global const float *d1p = dst + (y-1)*stride;
+    \\            global const float *d2p = out + (y-2)*stride;
+    \\            global const float *d1n = dst + (y+1)*stride;
+    \\            global const float *d2n = dst + (y+2)*stride;
+    \\            global const float *d3p = src + rowidx[off*4+0]*stride;
+    \\            global const float *d3n = src + rowidx[off*4+3]*stride;
+    \\            for (int x = lid; x < w; x += lsz) {
+    \\                const int dirc = dmap[(long)off*stride + x];
+    \\                float cint = use_scp ? scp[y*stride + x] : (0.5625f*(d1p[x]+d1n[x]) - 0.0625f*(d3p[x]+d3n[x]));
+    \\                int dirt = dmap[(long)(off-1)*stride + x];
+    \\                int dirb = dmap[(long)(off+1)*stride + x];
+    \\                int maxoff = hp ? ((dirc & 1) == 0 ? abs(dirc>>1) : max(abs(dirc>>1), abs((dirc+1)>>1))) : abs(dirc);
+    \\                if (dirc == 0 || max(dirc*dirt, dirc*dirb) < 0 || (dirt==dirb && dirt==0)
+    \\                    || x + maxoff >= w || x - maxoff < 0) {
+    \\                    out[y*stride + x] = cint;
+    \\                    continue;
+    \\                }
+    \\                float it, ib, vt, vb;
+    \\                int dabs;
+    \\                if (hp && (dirc & 1) != 0) {
+    \\                    int d20 = dirc>>1, d21 = (dirc+1)>>1;
+    \\                    int xp0 = x+d20, xp1 = x+d21, xm0 = x-d20, xm1 = x-d21;
+    \\                    float s2psum = d2p[xp0]+d2p[xp1], s1psum = d1p[xp0]+d1p[xp1];
+    \\                    float pa0 = drow[xp0]+drow[xp1], ps0 = drow[xm0]+drow[xm1];
+    \\                    float s1nsum = d1n[xm0]+d1n[xm1], s2nsum = d2n[xm0]+d2n[xm1];
+    \\                    it = (s2psum + ps0)*0.25f;
+    \\                    vt = (fabs(s2psum-s1psum) + fabs(pa0-s1psum))*0.5f;
+    \\                    ib = (pa0 + s2nsum)*0.25f;
+    \\                    vb = (fabs(s2nsum-s1nsum) + fabs(ps0-s1nsum))*0.5f;
+    \\                    dabs = abs(dirc) >> 1;
+    \\                } else {
+    \\                    int offh = hp ? (dirc>>1) : dirc;
+    \\                    int xpd = x+offh, xmd = x-offh;
+    \\                    it = (d2p[xpd] + drow[xmd]) * 0.5f;
+    \\                    ib = (drow[xpd] + d2n[xmd]) * 0.5f;
+    \\                    vt = fabs(d2p[xpd]-d1p[xpd]) + fabs(drow[xpd]-d1p[xpd]);
+    \\                    vb = fabs(d2n[xmd]-d1n[xmd]) + fabs(drow[xmd]-d1n[xmd]);
+    \\                    dabs = hp ? (abs(dirc)>>1) : abs(dirc);
+    \\                }
+    \\                float vc = fabs(drow[x]-d1p[x]) + fabs(drow[x]-d1n[x]);
+    \\                float d0 = fabs(it-d1p[x]), d1 = fabs(ib-d1n[x]), d2 = fabs(vt-vc), d3 = fabs(vb-vc);
+    \\                float mdiff0 = (vmode==1)?fmin(d0,d1):(vmode==2)?(d0+d1)*0.5f:fmax(d0,d1);
+    \\                float mdiff1 = (vmode==1)?fmin(d2,d3):(vmode==2)?(d2+d3)*0.5f:fmax(d2,d3);
+    \\                float a0 = mdiff0*rcp0, a1 = mdiff1*rcp1;
+    \\                float a2 = fmax((vthresh2 - (float)dabs)*rcp2, 0.0f);
+    \\                float a = fmin(fmax(a0, fmax(a1,a2)), 1.0f);
+    \\                out[y*stride + x] = (1.0f-a)*drow[x] + a*cint;
+    \\            }
+    \\        }
+    \\        barrier(CLK_GLOBAL_MEM_FENCE);
     \\    }
-    \\    float it, ib, vt, vb;
-    \\    int dabs;
-    \\    if (hp && (dirc & 1) != 0) {
-    \\        int d20 = dirc>>1, d21 = (dirc+1)>>1;
-    \\        int xp0 = x+d20, xp1 = x+d21, xm0 = x-d20, xm1 = x-d21;
-    \\        float s2psum = d2p[xp0]+d2p[xp1], s1psum = d1p[xp0]+d1p[xp1];
-    \\        float pa0 = drow[xp0]+drow[xp1], ps0 = drow[xm0]+drow[xm1];
-    \\        float s1nsum = d1n[xm0]+d1n[xm1], s2nsum = d2n[xm0]+d2n[xm1];
-    \\        it = (s2psum + ps0)*0.25f;
-    \\        vt = (fabs(s2psum-s1psum) + fabs(pa0-s1psum))*0.5f;
-    \\        ib = (pa0 + s2nsum)*0.25f;
-    \\        vb = (fabs(s2nsum-s1nsum) + fabs(ps0-s1nsum))*0.5f;
-    \\        dabs = abs(dirc) >> 1;
-    \\    } else {
-    \\        int offh = hp ? (dirc>>1) : dirc;
-    \\        int xpd = x+offh, xmd = x-offh;
-    \\        it = (d2p[xpd] + drow[xmd]) * 0.5f;
-    \\        ib = (drow[xpd] + d2n[xmd]) * 0.5f;
-    \\        vt = fabs(d2p[xpd]-d1p[xpd]) + fabs(drow[xpd]-d1p[xpd]);
-    \\        vb = fabs(d2n[xmd]-d1n[xmd]) + fabs(drow[xmd]-d1n[xmd]);
-    \\        dabs = hp ? (abs(dirc)>>1) : abs(dirc);
-    \\    }
-    \\    float vc = fabs(drow[x]-d1p[x]) + fabs(drow[x]-d1n[x]);
-    \\    float d0 = fabs(it-d1p[x]), d1 = fabs(ib-d1n[x]), d2 = fabs(vt-vc), d3 = fabs(vb-vc);
-    \\    float mdiff0 = (vmode==1)?fmin(d0,d1):(vmode==2)?(d0+d1)*0.5f:fmax(d0,d1);
-    \\    float mdiff1 = (vmode==1)?fmin(d2,d3):(vmode==2)?(d2+d3)*0.5f:fmax(d2,d3);
-    \\    float a0 = mdiff0*rcp0, a1 = mdiff1*rcp1;
-    \\    float a2 = fmax((vthresh2 - (float)dabs)*rcp2, 0.0f);
-    \\    float a = fmin(fmax(a0, fmax(a1,a2)), 1.0f);
-    \\    out[y*stride + x] = (1.0f-a)*drow[x] + a*cint;
     \\}
     \\
     \\// out[c*out_stride + r] = in[r*in_stride + c], for r<in_h, c<in_w. global=(in_w,in_h).
@@ -386,6 +406,7 @@ const Data = struct {
     n_interp: u32 = 0,
     tpitch: u32 = 0,
     lws: usize = 0,
+    max_wg: usize = 256, // device CL_DEVICE_MAX_WORK_GROUP_SIZE (caps the vcheck workgroup)
 
     // horizontal mirror-pad margin (covers max interp/cost reach) + padded stride
     pad: u32 = 0,
@@ -464,6 +485,78 @@ const Stream = struct {
         self.k_vcheck = try cl.createKernel(d.program, "vcheck");
         errdefer self.k_vcheck.release();
         self.k_transpose = try cl.createKernel(d.program, "transpose");
+        try self.setStaticArgs(d);
+    }
+
+    // Set all immutable kernel args ONCE (this Stream owns its kernels for life and
+    // is used by one frame at a time, so OpenCL's sticky arg state carries them
+    // frame-to-frame). Only `field` (copy_kept arg 5, vcheck arg 9) varies per frame
+    // and is re-set in process(); the transpose kernel is reused per-call with
+    // different buffers so its args stay in runTranspose. Buffer CONTENTS change per
+    // frame (re-uploaded), but the buffer-handle args are fixed per Stream.
+    fn setStaticArgs(self: *Stream, d: *Data) !void {
+        const w: c_int = @intCast(d.w);
+        const stride: c_int = @intCast(d.stride);
+        const src_h_i: c_int = @intCast(d.src_h);
+
+        // pad_src
+        try self.k_pad.setArg(@TypeOf(self.d_srcpad), 0, self.d_srcpad);
+        try self.k_pad.setArg(@TypeOf(self.d_src), 1, self.d_src);
+        try self.k_pad.setArg(c_int, 2, w);
+        try self.k_pad.setArg(c_int, 3, stride);
+        try self.k_pad.setArg(c_int, 4, @intCast(d.pstride));
+        try self.k_pad.setArg(c_int, 5, @intCast(d.pad));
+        try self.k_pad.setArg(c_int, 6, src_h_i);
+
+        // copy_kept (arg 5 = field is per-frame)
+        try self.k_copy.setArg(@TypeOf(self.d_dst), 0, self.d_dst);
+        try self.k_copy.setArg(@TypeOf(self.d_src), 1, self.d_src);
+        try self.k_copy.setArg(c_int, 2, w);
+        try self.k_copy.setArg(c_int, 3, stride);
+        try self.k_copy.setArg(c_int, 4, @intFromBool(d.dh));
+        try self.k_copy.setArg(c_int, 6, src_h_i);
+
+        // interp / interp_hp (no field arg; all immutable, incl. the dynamic __local)
+        const ik = if (d.hp) self.k_interp_hp else self.k_interp;
+        try ik.setArg(@TypeOf(self.d_dst), 0, self.d_dst);
+        try ik.setArg(@TypeOf(self.d_srcpad), 1, self.d_srcpad);
+        try ik.setArg(@TypeOf(self.d_rowidx), 2, self.d_rowidx);
+        try ik.setArg(@TypeOf(self.d_dsty), 3, self.d_dsty);
+        try ik.setArg(@TypeOf(self.d_pbackt), 4, self.d_pbackt);
+        try ik.setArg(@TypeOf(self.d_dmap), 5, self.d_dmap);
+        try ik.setArg(c_int, 6, w);
+        try ik.setArg(c_int, 7, stride);
+        try ik.setArg(c_int, 8, @intCast(d.pstride));
+        try ik.setArg(c_int, 9, @intCast(d.pad));
+        try ik.setArg(c_int, 10, @intCast(d.mdis));
+        try ik.setArg(c_int, 11, @intCast(d.nrad));
+        try ik.setArg(f32, 12, d.alpha);
+        try ik.setArg(f32, 13, d.beta);
+        try ik.setArg(f32, 14, d.gamma);
+        try ik.setArg(f32, 15, d.one_minus_ab);
+        if (cl.c.clSetKernelArg(ik.handle, 16, d.w * @sizeOf(i32), null) != cl.c.CL_SUCCESS) return error.SetKernelArg;
+
+        // vcheck (arg 9 = field is per-frame; use_scp is constant). Only used when on.
+        if (d.vcheck > 0) {
+            const use_scp: c_int = if (d.sclip != null) 1 else 0;
+            try self.k_vcheck.setArg(@TypeOf(self.d_dst2), 0, self.d_dst2);
+            try self.k_vcheck.setArg(@TypeOf(self.d_dst), 1, self.d_dst);
+            try self.k_vcheck.setArg(@TypeOf(self.d_src), 2, self.d_src);
+            try self.k_vcheck.setArg(@TypeOf(self.d_rowidx), 3, self.d_rowidx);
+            try self.k_vcheck.setArg(@TypeOf(self.d_dmap), 4, self.d_dmap);
+            try self.k_vcheck.setArg(@TypeOf(self.d_scp), 5, self.d_scp);
+            try self.k_vcheck.setArg(c_int, 6, w);
+            try self.k_vcheck.setArg(c_int, 7, stride);
+            try self.k_vcheck.setArg(c_int, 8, @intCast(d.dst_h));
+            try self.k_vcheck.setArg(c_int, 10, @intCast(d.n_interp));
+            try self.k_vcheck.setArg(c_int, 11, @intCast(d.vcheck));
+            try self.k_vcheck.setArg(c_int, 12, use_scp);
+            try self.k_vcheck.setArg(c_int, 13, @intFromBool(d.hp));
+            try self.k_vcheck.setArg(f32, 14, d.rcp0);
+            try self.k_vcheck.setArg(f32, 15, d.rcp1);
+            try self.k_vcheck.setArg(f32, 16, d.rcp2);
+            try self.k_vcheck.setArg(f32, 17, d.vthresh2);
+        }
     }
 
     pub fn deinit(self: *Stream) void {
@@ -508,9 +601,21 @@ fn initOpenCL(d: *Data) !void {
     defer allocator.free(devices);
     if (devices.len == 0) return error.NoDevices;
     d.device = devices[0];
+    // Cap the single-workgroup vcheck launch at the device limit — a hardcoded
+    // 1024 would error (CL_INVALID_WORK_GROUP_SIZE) on devices whose max WG < 1024
+    // (CPU runtimes, some iGPUs). vcheck grid-strides over x, so a smaller WG is
+    // still correct, just fewer warps to hide the inter-row latency.
+    var dev_max_wg: usize = 0;
+    if (cl.c.clGetDeviceInfo(d.device.id, cl.c.CL_DEVICE_MAX_WORK_GROUP_SIZE, @sizeOf(usize), &dev_max_wg, null) == cl.c.CL_SUCCESS and dev_max_wg > 0) {
+        d.max_wg = dev_max_wg;
+    }
     d.context = try cl.createContext(&.{d.device}, .{ .platform = platform });
     d.program = try cl.createProgramWithSource(d.context, kernel_src);
-    d.program.build(&.{d.device}, "-cl-std=CL3.0") catch |err| {
+    // Specialize the cost loop's trip count at build time (per-instance program)
+    // so it unrolls with constant k-offsets; keeps the exact sw accumulation order.
+    const build_opts = try std.fmt.allocPrintSentinel(allocator, "-cl-std=CL3.0 -DCN={d}", .{d.nrad}, 0);
+    defer allocator.free(build_opts);
+    d.program.build(&.{d.device}, build_opts) catch |err| {
         if (err == error.BuildProgramFailure) {
             const log = try d.program.getBuildLog(allocator, d.device);
             defer allocator.free(log);
@@ -523,7 +628,6 @@ fn initOpenCL(d: *Data) !void {
 fn process(d: *Data, s: *Stream, dstp: []f32, srcp: []const f32, scpp: ?[]const f32, field: u8) !void {
     const w: i32 = @intCast(d.w);
     const src_h_i: i32 = @intCast(d.src_h);
-    const stride = d.stride;
     const none: []const cl.Event = &.{};
 
     // Per-frame: source row indices for the 4 stencil rows of each interp row.
@@ -562,48 +666,19 @@ fn process(d: *Data, s: *Stream, dstp: []f32, srcp: []const f32, scpp: ?[]const 
 
     // Build the horizontally mirror-padded source once, so interp/interp_hp can
     // read contiguous padded memory with no per-access refl() in the hot loop.
-    try s.k_pad.setArg(@TypeOf(s.d_srcpad), 0, s.d_srcpad);
-    try s.k_pad.setArg(@TypeOf(s.d_src), 1, s.d_src);
-    try s.k_pad.setArg(c_int, 2, w);
-    try s.k_pad.setArg(c_int, 3, @intCast(stride));
-    try s.k_pad.setArg(c_int, 4, @intCast(d.pstride));
-    try s.k_pad.setArg(c_int, 5, @intCast(d.pad));
-    try s.k_pad.setArg(c_int, 6, src_h_i);
+    // (immutable kernel args set once in Stream.setStaticArgs)
     const pad_gws: [2]usize = .{ vsh.ceilN(@as(usize, d.pad) * 2 + d.w, 16), d.src_h };
     const pad_lws: [2]usize = .{ 16, 1 };
     (try s.queue.enqueueNDRangeKernel(s.k_pad, null, &pad_gws, &pad_lws, none)).release();
 
-    // copy kept field rows
-    try s.k_copy.setArg(@TypeOf(s.d_dst), 0, s.d_dst);
-    try s.k_copy.setArg(@TypeOf(s.d_src), 1, s.d_src);
-    try s.k_copy.setArg(c_int, 2, w);
-    try s.k_copy.setArg(c_int, 3, @intCast(stride));
-    try s.k_copy.setArg(c_int, 4, @intFromBool(d.dh));
+    // copy kept field rows (only `field` is per-frame; other args set in init)
     try s.k_copy.setArg(c_int, 5, field);
-    try s.k_copy.setArg(c_int, 6, src_h_i);
     const copy_gws: [2]usize = .{ vsh.ceilN(@intCast(w), 16), d.dst_h };
     const copy_lws: [2]usize = .{ 16, 1 };
     (try s.queue.enqueueNDRangeKernel(s.k_copy, null, &copy_gws, &copy_lws, none)).release();
 
-    // interp rows (half-pel uses a distinct kernel with the same arg layout)
+    // interp rows (half-pel uses a distinct kernel; all args set in init)
     const ik = if (d.hp) s.k_interp_hp else s.k_interp;
-    try ik.setArg(@TypeOf(s.d_dst), 0, s.d_dst);
-    try ik.setArg(@TypeOf(s.d_srcpad), 1, s.d_srcpad);
-    try ik.setArg(@TypeOf(s.d_rowidx), 2, s.d_rowidx);
-    try ik.setArg(@TypeOf(s.d_dsty), 3, s.d_dsty);
-    try ik.setArg(@TypeOf(s.d_pbackt), 4, s.d_pbackt);
-    try ik.setArg(@TypeOf(s.d_dmap), 5, s.d_dmap);
-    try ik.setArg(c_int, 6, w);
-    try ik.setArg(c_int, 7, @intCast(stride));
-    try ik.setArg(c_int, 8, @intCast(d.pstride));
-    try ik.setArg(c_int, 9, @intCast(d.pad));
-    try ik.setArg(c_int, 10, @intCast(d.mdis));
-    try ik.setArg(c_int, 11, @intCast(d.nrad));
-    try ik.setArg(f32, 12, d.alpha);
-    try ik.setArg(f32, 13, d.beta);
-    try ik.setArg(f32, 14, d.gamma);
-    try ik.setArg(f32, 15, d.one_minus_ab);
-    if (cl.c.clSetKernelArg(ik.handle, 16, d.w * @sizeOf(i32), null) != cl.c.CL_SUCCESS) return error.SetKernelArg;
     const interp_gws: [2]usize = .{ d.lws, d.n_interp };
     const interp_lws: [2]usize = .{ d.lws, 1 };
     (try s.queue.enqueueNDRangeKernel(ik, null, &interp_gws, &interp_lws, none)).release();
@@ -611,7 +686,8 @@ fn process(d: *Data, s: *Stream, dstp: []f32, srcp: []const f32, scpp: ?[]const 
     // pick the buffer holding the finished (vertical-orientation) result
     var result = s.d_dst;
     if (d.vcheck > 0) {
-        const use_scp: c_int = if (scpp) |sp| blk: {
+        // sclip (if any) is uploaded per frame; its buffer arg + use_scp are static.
+        if (scpp) |sp| {
             // sclip is at output resolution; transpose it into column-major for EEDI3H.
             if (d.horizontal) {
                 (try s.queue.enqueueWriteBuffer(f32, s.d_scpframe, false, 0, sp, none)).release();
@@ -619,8 +695,7 @@ fn process(d: *Data, s: *Stream, dstp: []f32, srcp: []const f32, scpp: ?[]const 
             } else {
                 (try s.queue.enqueueWriteBuffer(f32, s.d_scp, false, 0, sp, none)).release();
             }
-            break :blk 1;
-        } else 0;
+        }
 
         // Seed the output buffer with the interp snapshot so kept rows and
         // non-vcheckable interp rows pass through, and so each row's d2p (the
@@ -629,38 +704,19 @@ fn process(d: *Data, s: *Stream, dstp: []f32, srcp: []const f32, scpp: ?[]const 
             return error.EnqueueCopyBuffer;
         }
 
-        try s.k_vcheck.setArg(@TypeOf(s.d_dst2), 0, s.d_dst2);
-        try s.k_vcheck.setArg(@TypeOf(s.d_dst), 1, s.d_dst);
-        try s.k_vcheck.setArg(@TypeOf(s.d_src), 2, s.d_src);
-        try s.k_vcheck.setArg(@TypeOf(s.d_rowidx), 3, s.d_rowidx);
-        try s.k_vcheck.setArg(@TypeOf(s.d_dmap), 4, s.d_dmap);
-        try s.k_vcheck.setArg(@TypeOf(s.d_scp), 5, s.d_scp);
-        try s.k_vcheck.setArg(c_int, 6, w);
-        try s.k_vcheck.setArg(c_int, 7, @intCast(stride));
-        try s.k_vcheck.setArg(c_int, 8, @intCast(d.dst_h));
+        // `field` is the only per-frame vcheck arg; the rest are set in init.
         try s.k_vcheck.setArg(c_int, 9, field);
-        try s.k_vcheck.setArg(c_int, 10, @intCast(d.n_interp));
-        // arg 11 (off) is set per interpolated row in the loop below.
-        try s.k_vcheck.setArg(c_int, 12, @intCast(d.vcheck));
-        try s.k_vcheck.setArg(c_int, 13, use_scp);
-        try s.k_vcheck.setArg(c_int, 14, @intFromBool(d.hp));
-        try s.k_vcheck.setArg(f32, 15, d.rcp0);
-        try s.k_vcheck.setArg(f32, 16, d.rcp1);
-        try s.k_vcheck.setArg(f32, 17, d.rcp2);
-        try s.k_vcheck.setArg(f32, 18, d.vthresh2);
 
-        // Row `off` reads the vchecked result of row `off-1` (d2p), so the
-        // launches must run sequentially. The in-order queue guarantees that.
-        const vc_gws: [1]usize = .{vsh.ceilN(@intCast(w), 64)};
-        const vc_lws: [1]usize = .{64};
-        const dst_h_i: i32 = @intCast(d.dst_h);
-        var voff: u32 = 1;
-        while (voff + 1 < d.n_interp) : (voff += 1) {
-            const y: i32 = @as(i32, field) + 2 * @as(i32, @intCast(voff));
-            if (y < 2 or y + 2 >= dst_h_i) continue;
-            try s.k_vcheck.setArg(c_int, 11, @intCast(voff));
-            (try s.queue.enqueueNDRangeKernel(s.k_vcheck, null, &vc_gws, &vc_lws, none)).release();
-        }
+        // Single launch: one workgroup walks the interpolated rows in order,
+        // barrier()-ing between them so each row's d2p (the previous interp row,
+        // read at x±dir) sees the finished, already-vchecked prior row. Bit-exact
+        // with the CPU's in-place feedback, with no per-row launch overhead. A
+        // large workgroup keeps enough warps resident to hide the serial inter-row
+        // dependency latency on the single SM this (necessarily) runs on.
+        const vc_wg: usize = @min(@as(usize, 1024), d.max_wg);
+        const vc_gws: [1]usize = .{vc_wg};
+        const vc_lws: [1]usize = .{vc_wg};
+        (try s.queue.enqueueNDRangeKernel(s.k_vcheck, null, &vc_gws, &vc_lws, none)).release();
         result = s.d_dst2;
     }
 
@@ -857,7 +913,8 @@ fn createImpl(in: ?*const vs.Map, out: ?*vs.Map, _: ?*anyopaque, core_ptr: ?*vs.
         d.src_h = @intCast(vi_in.height);
         d.dst_h = @intCast(d.vi.height);
     }
-    d.stride = @intCast(vsh.ceilN(@as(usize, d.w), 8));
+
+    d.stride = vszipcl.strideFromVi(&d.vi)[0];
     d.n_interp = if (d.dh) d.src_h else d.src_h / 2;
     d.tpitch = @intCast(if (d.hp) 4 * mdis + 1 else 2 * mdis + 1);
     d.lws = vsh.ceilN(@as(usize, d.tpitch), 32);
