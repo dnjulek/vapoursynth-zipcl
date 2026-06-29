@@ -19,9 +19,8 @@ const Data = struct {
     sigma_color: f32,
     radius: i32,
 
-    context: cl.Context,
+    platform: cl.Platform,
     device: cl.Device,
-    program: cl.Program,
     buff_size: usize,
 
     pool: clpool.Pool(Stream, Data),
@@ -30,19 +29,33 @@ const Data = struct {
 /// Per-concurrent-frame OpenCL resources. One is acquired per getFrame call so
 /// frames never share a queue, buffers or kernel.
 const Stream = struct {
+    context: cl.Context,
+    program: cl.Program,
     queue: cl.CommandQueue,
     src: cl.Buffer(f32),
     dst: cl.Buffer(f32),
     kernel: cl.Kernel,
 
     pub fn init(self: *Stream, d: *Data) !void {
-        self.queue = try cl.createCommandQueue(d.context, d.device, .{});
+        self.context = try cl.createContext(&.{d.device}, .{ .platform = d.platform });
+        errdefer self.context.release();
+        self.program = try cl.createProgramWithSource(self.context, bilateral);
+        errdefer self.program.release();
+        self.program.build(&.{d.device}, "-cl-std=CL3.0") catch |err| {
+            if (err == error.BuildProgramFailure) {
+                const log = try self.program.getBuildLog(allocator, d.device);
+                defer allocator.free(log);
+                std.log.err("OpenCL kernel build failed: {s}", .{log});
+            }
+            return err;
+        };
+        self.queue = try cl.createCommandQueue(self.context, d.device, .{});
         errdefer self.queue.release();
-        self.src = try cl.createBuffer(f32, d.context, .{ .read_only = true }, d.buff_size);
+        self.src = try cl.createBuffer(f32, self.context, .{ .read_only = true }, d.buff_size);
         errdefer self.src.release();
-        self.dst = try cl.createBuffer(f32, d.context, .{ .read_write = true }, d.buff_size);
+        self.dst = try cl.createBuffer(f32, self.context, .{ .read_write = true }, d.buff_size);
         errdefer self.dst.release();
-        self.kernel = try cl.createKernel(d.program, "bilateral");
+        self.kernel = try cl.createKernel(self.program, "bilateral");
     }
 
     pub fn deinit(self: *Stream) void {
@@ -50,6 +63,8 @@ const Stream = struct {
         self.dst.release();
         self.src.release();
         self.queue.release();
+        self.program.release();
+        self.context.release();
     }
 };
 
@@ -106,16 +121,7 @@ fn initOpenCL(d: *Data) !void {
 
     d.device = devices[0];
 
-    d.context = try cl.createContext(&.{d.device}, .{ .platform = platform });
-    d.program = try cl.createProgramWithSource(d.context, bilateral);
-    d.program.build(&.{d.device}, "-cl-std=CL3.0") catch |err| {
-        if (err == error.BuildProgramFailure) {
-            const log = try d.program.getBuildLog(allocator, d.device);
-            defer allocator.free(log);
-            std.log.err("OpenCL kernel build failed: {s}", .{log});
-        }
-        return err;
-    };
+    d.platform = platform;
 }
 
 fn process(d: *Data, s: *Stream, dstp: []f32, srcp: []const f32, w: i32, h: i32, stride: i32) !void {
@@ -195,8 +201,6 @@ fn free(instance_data: ?*anyopaque, _: ?*vs.Core, vsapi: ?*const vs.API) callcon
     const d: *Data = @ptrCast(@alignCast(instance_data));
 
     d.pool.deinit();
-    d.program.release();
-    d.context.release();
 
     vsapi.?.freeNode.?(d.node);
     allocator.destroy(d);
@@ -253,8 +257,6 @@ pub fn create(in: ?*const vs.Map, out: ?*vs.Map, _: ?*anyopaque, core: ?*vs.Core
         map_out.setError("Bilateral: OpenCL stream init failed.");
         std.log.err("OpenCL stream init failed: {}", .{err});
         data.pool.deinit();
-        data.program.release();
-        data.context.release();
         zapi.freeNode(d.node);
         allocator.destroy(data);
         return;

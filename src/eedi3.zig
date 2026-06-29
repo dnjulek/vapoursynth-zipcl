@@ -419,13 +419,14 @@ const Data = struct {
     in_stride: u32 = 0,
     out_stride: u32 = 0,
 
-    context: cl.Context = undefined,
+    platform: cl.Platform = undefined,
     device: cl.Device = undefined,
-    program: cl.Program = undefined,
     pool: clpool.Pool(Stream, Data) = .{},
 };
 
 const Stream = struct {
+    context: cl.Context,
+    program: cl.Program,
     queue: cl.CommandQueue,
     d_src: cl.Buffer(f32),
     d_srcpad: cl.Buffer(f32),
@@ -447,44 +448,58 @@ const Stream = struct {
     k_transpose: cl.Kernel,
 
     pub fn init(self: *Stream, d: *Data) !void {
-        self.queue = try cl.createCommandQueue(d.context, d.device, .{});
+        self.context = try cl.createContext(&.{d.device}, .{ .platform = d.platform });
+        errdefer self.context.release();
+        self.program = try cl.createProgramWithSource(self.context, kernel_src);
+        errdefer self.program.release();
+        const build_opts = try std.fmt.allocPrintSentinel(allocator, "-cl-std=CL3.0 -DCN={d}", .{d.nrad}, 0);
+        defer allocator.free(build_opts);
+        self.program.build(&.{d.device}, build_opts) catch |err| {
+            if (err == error.BuildProgramFailure) {
+                const log = try self.program.getBuildLog(allocator, d.device);
+                defer allocator.free(log);
+                std.log.err("EEDI3 OpenCL build failed: {s}", .{log});
+            }
+            return err;
+        };
+        self.queue = try cl.createCommandQueue(self.context, d.device, .{});
         errdefer self.queue.release();
-        self.d_src = try cl.createBuffer(f32, d.context, .{ .read_only = true }, d.stride * d.src_h);
+        self.d_src = try cl.createBuffer(f32, self.context, .{ .read_only = true }, d.stride * d.src_h);
         errdefer self.d_src.release();
-        self.d_srcpad = try cl.createBuffer(f32, d.context, .{ .read_write = true }, d.pstride * d.src_h);
+        self.d_srcpad = try cl.createBuffer(f32, self.context, .{ .read_write = true }, d.pstride * d.src_h);
         errdefer self.d_srcpad.release();
-        self.d_dst = try cl.createBuffer(f32, d.context, .{ .read_write = true }, d.stride * d.dst_h);
+        self.d_dst = try cl.createBuffer(f32, self.context, .{ .read_write = true }, d.stride * d.dst_h);
         errdefer self.d_dst.release();
-        self.d_rowidx = try cl.createBuffer(i32, d.context, .{ .read_only = true }, d.n_interp * 4);
+        self.d_rowidx = try cl.createBuffer(i32, self.context, .{ .read_only = true }, d.n_interp * 4);
         errdefer self.d_rowidx.release();
-        self.d_dsty = try cl.createBuffer(i32, d.context, .{ .read_only = true }, d.n_interp);
+        self.d_dsty = try cl.createBuffer(i32, self.context, .{ .read_only = true }, d.n_interp);
         errdefer self.d_dsty.release();
-        self.d_pbackt = try cl.createBuffer(i8, d.context, .{ .read_write = true }, @as(usize, d.n_interp) * d.w * d.tpitch);
+        self.d_pbackt = try cl.createBuffer(i8, self.context, .{ .read_write = true }, @as(usize, d.n_interp) * d.w * d.tpitch);
         errdefer self.d_pbackt.release();
-        self.d_dmap = try cl.createBuffer(i32, d.context, .{ .read_write = true }, @as(usize, d.n_interp) * d.stride);
+        self.d_dmap = try cl.createBuffer(i32, self.context, .{ .read_write = true }, @as(usize, d.n_interp) * d.stride);
         errdefer self.d_dmap.release();
-        self.d_dst2 = try cl.createBuffer(f32, d.context, .{ .read_write = true }, if (d.vcheck > 0) d.stride * d.dst_h else 1);
+        self.d_dst2 = try cl.createBuffer(f32, self.context, .{ .read_write = true }, if (d.vcheck > 0) d.stride * d.dst_h else 1);
         errdefer self.d_dst2.release();
-        self.d_inframe = try cl.createBuffer(f32, d.context, .{ .read_write = true }, if (d.horizontal) d.in_stride * d.in_h else 1);
+        self.d_inframe = try cl.createBuffer(f32, self.context, .{ .read_write = true }, if (d.horizontal) d.in_stride * d.in_h else 1);
         errdefer self.d_inframe.release();
-        self.d_outframe = try cl.createBuffer(f32, d.context, .{ .read_write = true }, if (d.horizontal) d.out_stride * d.in_h else 1);
+        self.d_outframe = try cl.createBuffer(f32, self.context, .{ .read_write = true }, if (d.horizontal) d.out_stride * d.in_h else 1);
         errdefer self.d_outframe.release();
         const have_scp = d.sclip != null and d.vcheck > 0;
-        self.d_scp = try cl.createBuffer(f32, d.context, .{ .read_write = true }, if (have_scp) d.stride * d.dst_h else 1);
+        self.d_scp = try cl.createBuffer(f32, self.context, .{ .read_write = true }, if (have_scp) d.stride * d.dst_h else 1);
         errdefer self.d_scp.release();
-        self.d_scpframe = try cl.createBuffer(f32, d.context, .{ .read_write = true }, if (have_scp and d.horizontal) d.out_stride * d.in_h else 1);
+        self.d_scpframe = try cl.createBuffer(f32, self.context, .{ .read_write = true }, if (have_scp and d.horizontal) d.out_stride * d.in_h else 1);
         errdefer self.d_scpframe.release();
-        self.k_copy = try cl.createKernel(d.program, "copy_kept");
+        self.k_copy = try cl.createKernel(self.program, "copy_kept");
         errdefer self.k_copy.release();
-        self.k_pad = try cl.createKernel(d.program, "pad_src");
+        self.k_pad = try cl.createKernel(self.program, "pad_src");
         errdefer self.k_pad.release();
-        self.k_interp = try cl.createKernel(d.program, "interp");
+        self.k_interp = try cl.createKernel(self.program, "interp");
         errdefer self.k_interp.release();
-        self.k_interp_hp = try cl.createKernel(d.program, "interp_hp");
+        self.k_interp_hp = try cl.createKernel(self.program, "interp_hp");
         errdefer self.k_interp_hp.release();
-        self.k_vcheck = try cl.createKernel(d.program, "vcheck");
+        self.k_vcheck = try cl.createKernel(self.program, "vcheck");
         errdefer self.k_vcheck.release();
-        self.k_transpose = try cl.createKernel(d.program, "transpose");
+        self.k_transpose = try cl.createKernel(self.program, "transpose");
         try self.setStaticArgs(d);
     }
 
@@ -579,6 +594,8 @@ const Stream = struct {
         self.d_srcpad.release();
         self.d_src.release();
         self.queue.release();
+        self.program.release();
+        self.context.release();
     }
 };
 
@@ -609,20 +626,7 @@ fn initOpenCL(d: *Data) !void {
     if (cl.c.clGetDeviceInfo(d.device.id, cl.c.CL_DEVICE_MAX_WORK_GROUP_SIZE, @sizeOf(usize), &dev_max_wg, null) == cl.c.CL_SUCCESS and dev_max_wg > 0) {
         d.max_wg = dev_max_wg;
     }
-    d.context = try cl.createContext(&.{d.device}, .{ .platform = platform });
-    d.program = try cl.createProgramWithSource(d.context, kernel_src);
-    // Specialize the cost loop's trip count at build time (per-instance program)
-    // so it unrolls with constant k-offsets; keeps the exact sw accumulation order.
-    const build_opts = try std.fmt.allocPrintSentinel(allocator, "-cl-std=CL3.0 -DCN={d}", .{d.nrad}, 0);
-    defer allocator.free(build_opts);
-    d.program.build(&.{d.device}, build_opts) catch |err| {
-        if (err == error.BuildProgramFailure) {
-            const log = try d.program.getBuildLog(allocator, d.device);
-            defer allocator.free(log);
-            std.log.err("EEDI3 OpenCL build failed: {s}", .{log});
-        }
-        return err;
-    };
+    d.platform = platform;
 }
 
 fn process(d: *Data, s: *Stream, dstp: []f32, srcp: []const f32, scpp: ?[]const f32, field: u8) !void {
@@ -803,8 +807,6 @@ fn getFrame(n: c_int, ar: vs.ActivationReason, instance_data: ?*anyopaque, _: ?*
 fn free(instance_data: ?*anyopaque, _: ?*vs.Core, vsapi: ?*const vs.API) callconv(.c) void {
     const d: *Data = @ptrCast(@alignCast(instance_data));
     d.pool.deinit();
-    d.program.release();
-    d.context.release();
     vsapi.?.freeNode.?(d.node);
     vsapi.?.freeNode.?(d.sclip);
     allocator.destroy(d);
@@ -943,8 +945,6 @@ fn createImpl(in: ?*const vs.Map, out: ?*vs.Map, _: ?*anyopaque, core_ptr: ?*vs.
         map_out.setError("EEDI3: OpenCL stream init failed.");
         std.log.err("EEDI3 stream init failed: {}", .{err});
         data.pool.deinit();
-        data.program.release();
-        data.context.release();
         allocator.destroy(data);
         keep = false;
         return;

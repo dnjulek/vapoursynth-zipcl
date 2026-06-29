@@ -15,12 +15,11 @@ const Data = struct {
     node: ?*vs.Node,
     vi: *const vs.VideoInfo,
 
-    context: cl.Context,
+    platform: cl.Platform,
     device: cl.Device,
-    program: cl.Program,
     buff_size: usize,
 
-    blur_kernel: cl.Buffer(f32), // read-only weights, shared across streams
+    blur_weights: []const f32, // read-only host weights; each stream builds its own device buffer
     ksize: i32,
 
     pool: clpool.Pool(Stream, Data),
@@ -28,34 +27,54 @@ const Data = struct {
 
 /// Per-concurrent-frame OpenCL resources.
 const Stream = struct {
+    context: cl.Context,
+    program: cl.Program,
     queue: cl.CommandQueue,
     src: cl.Buffer(f32),
     dst: cl.Buffer(f32),
     tmp: cl.Buffer(f32),
+    blur_kernel: cl.Buffer(f32),
     vertical_blur: cl.Kernel,
     horizontal_blur: cl.Kernel,
 
     pub fn init(self: *Stream, d: *Data) !void {
-        self.queue = try cl.createCommandQueue(d.context, d.device, .{});
+        self.context = try cl.createContext(&.{d.device}, .{ .platform = d.platform });
+        errdefer self.context.release();
+        self.program = try cl.createProgramWithSource(self.context, vertical_blur ++ horizontal_blur);
+        errdefer self.program.release();
+        self.program.build(&.{d.device}, "-cl-std=CL3.0") catch |err| {
+            if (err == error.BuildProgramFailure) {
+                const log = try self.program.getBuildLog(allocator, d.device);
+                defer allocator.free(log);
+                std.log.err("OpenCL kernel build failed: {s}", .{log});
+            }
+            return err;
+        };
+        self.queue = try cl.createCommandQueue(self.context, d.device, .{});
         errdefer self.queue.release();
-        self.src = try cl.createBuffer(f32, d.context, .{ .read_only = true }, d.buff_size);
+        self.src = try cl.createBuffer(f32, self.context, .{ .read_only = true }, d.buff_size);
         errdefer self.src.release();
-        self.dst = try cl.createBuffer(f32, d.context, .{ .read_write = true }, d.buff_size);
+        self.dst = try cl.createBuffer(f32, self.context, .{ .read_write = true }, d.buff_size);
         errdefer self.dst.release();
-        self.tmp = try cl.createBuffer(f32, d.context, .{ .read_write = true }, d.buff_size);
+        self.tmp = try cl.createBuffer(f32, self.context, .{ .read_write = true }, d.buff_size);
         errdefer self.tmp.release();
-        self.vertical_blur = try cl.createKernel(d.program, "vertical_blur");
+        self.blur_kernel = try cl.createBufferWithData(f32, self.context, .{ .read_only = true }, d.blur_weights);
+        errdefer self.blur_kernel.release();
+        self.vertical_blur = try cl.createKernel(self.program, "vertical_blur");
         errdefer self.vertical_blur.release();
-        self.horizontal_blur = try cl.createKernel(d.program, "horizontal_blur");
+        self.horizontal_blur = try cl.createKernel(self.program, "horizontal_blur");
     }
 
     pub fn deinit(self: *Stream) void {
         self.horizontal_blur.release();
         self.vertical_blur.release();
+        self.blur_kernel.release();
         self.tmp.release();
         self.dst.release();
         self.src.release();
         self.queue.release();
+        self.program.release();
+        self.context.release();
     }
 };
 
@@ -155,16 +174,7 @@ fn initOpenCL(d: *Data) !void {
 
     d.device = devices[0];
 
-    d.context = try cl.createContext(&.{d.device}, .{ .platform = platform });
-    d.program = try cl.createProgramWithSource(d.context, vertical_blur ++ horizontal_blur);
-    d.program.build(&.{d.device}, "-cl-std=CL3.0") catch |err| {
-        if (err == error.BuildProgramFailure) {
-            const log = try d.program.getBuildLog(allocator, d.device);
-            defer allocator.free(log);
-            std.log.err("OpenCL kernel build failed: {s}", .{log});
-        }
-        return err;
-    };
+    d.platform = platform;
 }
 
 fn process(d: *Data, s: *Stream, dstp: []f32, srcp: []const f32, w: i32, h: i32, stride: i32) !void {
@@ -180,7 +190,7 @@ fn process(d: *Data, s: *Stream, dstp: []f32, srcp: []const f32, w: i32, h: i32,
     // Vertical pass: src -> tmp
     try s.vertical_blur.setArg(@TypeOf(s.tmp), 0, s.tmp);
     try s.vertical_blur.setArg(@TypeOf(s.src), 1, s.src);
-    try s.vertical_blur.setArg(@TypeOf(d.blur_kernel), 2, d.blur_kernel);
+    try s.vertical_blur.setArg(@TypeOf(s.blur_kernel), 2, s.blur_kernel);
     try s.vertical_blur.setArg(c_int, 3, d.ksize);
     try s.vertical_blur.setArg(c_int, 4, w);
     try s.vertical_blur.setArg(c_int, 5, h);
@@ -198,7 +208,7 @@ fn process(d: *Data, s: *Stream, dstp: []f32, srcp: []const f32, w: i32, h: i32,
     // Horizontal pass: tmp -> dst
     try s.horizontal_blur.setArg(@TypeOf(s.dst), 0, s.dst);
     try s.horizontal_blur.setArg(@TypeOf(s.tmp), 1, s.tmp);
-    try s.horizontal_blur.setArg(@TypeOf(d.blur_kernel), 2, d.blur_kernel);
+    try s.horizontal_blur.setArg(@TypeOf(s.blur_kernel), 2, s.blur_kernel);
     try s.horizontal_blur.setArg(c_int, 3, d.ksize);
     try s.horizontal_blur.setArg(c_int, 4, w);
     try s.horizontal_blur.setArg(c_int, 5, h);
@@ -263,9 +273,6 @@ fn free(instance_data: ?*anyopaque, _: ?*vs.Core, vsapi: ?*const vs.API) callcon
     const d: *Data = @ptrCast(@alignCast(instance_data));
 
     d.pool.deinit();
-    d.blur_kernel.release();
-    d.program.release();
-    d.context.release();
 
     vsapi.?.freeNode.?(d.node);
     allocator.destroy(d);
@@ -299,10 +306,10 @@ pub fn create(in: ?*const vs.Map, out: ?*vs.Map, _: ?*anyopaque, core: ?*vs.Core
     d.buff_size = stride * height;
 
     const sigma = map_in.getValue(f32, "sigma") orelse 0.5;
-    const blur_kernel = getGaussKernel(sigma) catch unreachable;
-    defer allocator.free(blur_kernel);
-    d.ksize = @intCast(blur_kernel.len);
-    d.blur_kernel = cl.createBufferWithData(f32, d.context, .{ .read_only = true }, blur_kernel) catch unreachable;
+    const blur_weights = getGaussKernel(sigma) catch unreachable;
+    defer allocator.free(blur_weights);
+    d.ksize = @intCast(blur_weights.len);
+    d.blur_weights = blur_weights;
 
     d.pool = .{};
 
@@ -321,9 +328,6 @@ pub fn create(in: ?*const vs.Map, out: ?*vs.Map, _: ?*anyopaque, core: ?*vs.Core
         map_out.setError("GaussBlur: OpenCL stream init failed.");
         std.log.err("OpenCL stream init failed: {}", .{err});
         data.pool.deinit();
-        data.blur_kernel.release();
-        data.program.release();
-        data.context.release();
         zapi.freeNode(d.node);
         allocator.destroy(data);
         return;

@@ -136,13 +136,14 @@ const Data = struct {
     pstride: u32 = 0, // ceilN(w+2a,8)
     ph: u32 = 0, // h + 2a
 
-    context: cl.Context = undefined,
+    platform: cl.Platform = undefined,
     device: cl.Device = undefined,
-    program: cl.Program = undefined,
     pool: clpool.Pool(Stream, Data) = .{},
 };
 
 const Stream = struct {
+    context: cl.Context,
+    program: cl.Program,
     queue: cl.CommandQueue,
     d_in: cl.Buffer(f32), // raw upload (stride*h)
     d_u1: cl.Buffer(f32), // zero-prepadded input (pstride*ph)
@@ -159,31 +160,47 @@ const Stream = struct {
 
     pub fn init(self: *Stream, d: *Data) !void {
         const npix = d.stride * d.h_;
-        self.queue = try cl.createCommandQueue(d.context, d.device, .{});
+        self.context = try cl.createContext(&.{d.device}, .{ .platform = d.platform });
+        errdefer self.context.release();
+        self.program = try cl.createProgramWithSource(self.context, kernel_src);
+        errdefer self.program.release();
+        const opts = try std.fmt.allocPrintSentinel(allocator,
+            \\-cl-std=CL3.0 -DVI_DIM_X={d} -DVI_DIM_Y={d} -DSTRIDE={d} -DPSTRIDE={d} -DPAD={d} -DNLM_S={d} -DWMODE={d} -DNLM_H={e}f -DNLM_WREF={e}f
+        , .{ d.w, d.h_, d.stride, d.pstride, d.pad, d.s, d.wmode, d.h, d.wref }, 0);
+        defer allocator.free(opts);
+        self.program.build(&.{d.device}, opts) catch |err| {
+            if (err == error.BuildProgramFailure) {
+                const log = try self.program.getBuildLog(allocator, d.device);
+                defer allocator.free(log);
+                std.log.err("NLMeans OpenCL build failed: {s}", .{log});
+            }
+            return err;
+        };
+        self.queue = try cl.createCommandQueue(self.context, d.device, .{});
         errdefer self.queue.release();
-        self.d_in = try cl.createBuffer(f32, d.context, .{ .read_write = true }, npix);
+        self.d_in = try cl.createBuffer(f32, self.context, .{ .read_write = true }, npix);
         errdefer self.d_in.release();
-        self.d_u1 = try cl.createBuffer(f32, d.context, .{ .read_write = true }, d.pstride * d.ph);
+        self.d_u1 = try cl.createBuffer(f32, self.context, .{ .read_write = true }, d.pstride * d.ph);
         errdefer self.d_u1.release();
-        self.d_u1z = try cl.createBuffer(f32, d.context, .{ .read_write = true }, npix);
+        self.d_u1z = try cl.createBuffer(f32, self.context, .{ .read_write = true }, npix);
         errdefer self.d_u1z.release();
-        self.d_u2 = try cl.createBuffer(f32, d.context, .{ .read_write = true }, npix * 2);
+        self.d_u2 = try cl.createBuffer(f32, self.context, .{ .read_write = true }, npix * 2);
         errdefer self.d_u2.release();
-        self.d_u4a = try cl.createBuffer(f32, d.context, .{ .read_write = true }, npix);
+        self.d_u4a = try cl.createBuffer(f32, self.context, .{ .read_write = true }, npix);
         errdefer self.d_u4a.release();
-        self.d_u4b = try cl.createBuffer(f32, d.context, .{ .read_write = true }, npix);
+        self.d_u4b = try cl.createBuffer(f32, self.context, .{ .read_write = true }, npix);
         errdefer self.d_u4b.release();
-        self.d_u5 = try cl.createBuffer(f32, d.context, .{ .read_write = true }, npix);
+        self.d_u5 = try cl.createBuffer(f32, self.context, .{ .read_write = true }, npix);
         errdefer self.d_u5.release();
-        self.k_zeropad = try cl.createKernel(d.program, "nlmZeropad");
+        self.k_zeropad = try cl.createKernel(self.program, "nlmZeropad");
         errdefer self.k_zeropad.release();
-        self.k_disthorz = try cl.createKernel(d.program, "nlmDistHorz");
+        self.k_disthorz = try cl.createKernel(self.program, "nlmDistHorz");
         errdefer self.k_disthorz.release();
-        self.k_vertical = try cl.createKernel(d.program, "nlmVertical");
+        self.k_vertical = try cl.createKernel(self.program, "nlmVertical");
         errdefer self.k_vertical.release();
-        self.k_accumulation = try cl.createKernel(d.program, "nlmAccumulation");
+        self.k_accumulation = try cl.createKernel(self.program, "nlmAccumulation");
         errdefer self.k_accumulation.release();
-        self.k_finish = try cl.createKernel(d.program, "nlmFinish");
+        self.k_finish = try cl.createKernel(self.program, "nlmFinish");
         errdefer self.k_finish.release();
         try self.setStaticArgs();
     }
@@ -220,6 +237,8 @@ const Stream = struct {
         self.d_u1.release();
         self.d_in.release();
         self.queue.release();
+        self.program.release();
+        self.context.release();
     }
 };
 
@@ -239,22 +258,7 @@ fn initOpenCL(d: *Data) !void {
     defer allocator.free(devices);
     if (devices.len == 0) return error.NoDevices;
     d.device = devices[0];
-    d.context = try cl.createContext(&.{d.device}, .{ .platform = platform });
-    d.program = try cl.createProgramWithSource(d.context, kernel_src);
-    // Per-instance specialization: bake every create-time constant into the program
-    // (KNL's build-option approach == EEDI3's -D pattern). exp() stays precise.
-    const opts = try std.fmt.allocPrintSentinel(allocator,
-        \\-cl-std=CL3.0 -DVI_DIM_X={d} -DVI_DIM_Y={d} -DSTRIDE={d} -DPSTRIDE={d} -DPAD={d} -DNLM_S={d} -DWMODE={d} -DNLM_H={e}f -DNLM_WREF={e}f
-    , .{ d.w, d.h_, d.stride, d.pstride, d.pad, d.s, d.wmode, d.h, d.wref }, 0);
-    defer allocator.free(opts);
-    d.program.build(&.{d.device}, opts) catch |err| {
-        if (err == error.BuildProgramFailure) {
-            const log = try d.program.getBuildLog(allocator, d.device);
-            defer allocator.free(log);
-            std.log.err("NLMeans OpenCL build failed: {s}", .{log});
-        }
-        return err;
-    };
+    d.platform = platform;
 }
 
 fn process(d: *Data, s: *Stream, dstp: []f32, srcp: []const f32) !void {
@@ -328,8 +332,6 @@ fn getFrame(n: c_int, ar: vs.ActivationReason, instance_data: ?*anyopaque, _: ?*
 fn free(instance_data: ?*anyopaque, _: ?*vs.Core, vsapi: ?*const vs.API) callconv(.c) void {
     const d: *Data = @ptrCast(@alignCast(instance_data));
     d.pool.deinit();
-    d.program.release();
-    d.context.release();
     vsapi.?.freeNode.?(d.node);
     allocator.destroy(d);
 }
@@ -406,8 +408,6 @@ pub fn create(in: ?*const vs.Map, out: ?*vs.Map, _: ?*anyopaque, core_ptr: ?*vs.
         map_out.setError("NLMeans: OpenCL stream init failed.");
         std.log.err("NLMeans stream init failed: {}", .{err});
         data.pool.deinit();
-        data.program.release();
-        data.context.release();
         allocator.destroy(data);
         keep = false;
         return;
