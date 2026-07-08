@@ -12,7 +12,7 @@ const zon = @import("zon");
 const allocator = std.heap.c_allocator;
 
 const mdis_max = 40;
-const tpitch_max = 2 * mdis_max + 1; // 81
+const tpitch_max = 2 * mdis_max + 1;
 
 const kernel_src =
     \\#define TPMAX 83  /* tpitch_max + 2 sentinels */
@@ -20,6 +20,55 @@ const kernel_src =
     \\#ifndef CN
     \\#define CN 2      /* = nrad; overridden by -DCN=<nrad> at build time so the
     \\                     hot cost loop has a compile-time bound and fully unrolls */
+    \\#endif
+    \\#ifndef MDIS
+    \\#define MDIS 20   /* overridden by -DMDIS=<mdis>: bakes tpitch so the strip fill's
+    \\                     i/TP remap is a mul-shift and cst[] indexing is compile-time */
+    \\#endif
+    \\#ifndef BX
+    \\#define BX 8      /* strip width: x-positions whose costs are batch-computed per
+    \\                     cooperative fill (one barrier), then BX cheap DP steps */
+    \\#endif
+    \\#define TP  (2*MDIS + 1)   /* directions, non-hp */
+    \\#define TPH (4*MDIS + 1)   /* directions, hp     */
+    \\
+    \\/* ---- io layer (-DBITS={8,16,32} -DHALF={0,1}; io type is clip-wide) ----
+    \\ * io_t   — element type of the RAW-domain buffers (src/dst/dst2/in-/outframe/scp).
+    \\ *          half is pointer-only without cl_khr_fp16 (not exposed on NVIDIA): NEVER
+    \\ *          dereference an io_t* directly on the HALF path — only LOAD_IO/STORE_IO.
+    \\ * raw_t  — bit-pattern type for VERBATIM element moves (copy_kept, transpose): kept
+    \\ *          rows and transposes must stay bit-lossless for every io type. float for
+    \\ *          BITS=32 keeps the f32 build token-identical to the pre-io kernel.
+    \\ * LOAD_IO(p,i)    — io -> f32: identity (f32) / exact widen (f16) / UNORM decode
+    \\ *                   v/PEAK, PEAK=(1<<BITS)-1 (full-range convention, like Deband).
+    \\ * STORE_IO(p,i,x) — f32 -> io: identity / vstore_half_rte / convert_sat_rte(x*PEAK)
+    \\ *                   (_sat is REQUIRED: the cubic interp overshoots [0,1] on edges). */
+    \\#ifndef BITS
+    \\#define BITS 32
+    \\#endif
+    \\#ifndef HALF
+    \\#define HALF 0
+    \\#endif
+    \\#if BITS == 32
+    \\typedef float io_t;
+    \\typedef float raw_t;
+    \\#define LOAD_IO(p, i) ((p)[i])
+    \\#define STORE_IO(p, i, x) ((p)[i] = (x))
+    \\#elif BITS == 16 && HALF
+    \\typedef half io_t;
+    \\typedef ushort raw_t;
+    \\#define LOAD_IO(p, i) vload_half((size_t)(i), p)
+    \\#define STORE_IO(p, i, x) vstore_half_rte((x), (size_t)(i), p)
+    \\#elif BITS == 16
+    \\typedef ushort io_t;
+    \\typedef ushort raw_t;
+    \\#define LOAD_IO(p, i) (convert_float((p)[i]) / 65535.0f)
+    \\#define STORE_IO(p, i, x) ((p)[i] = convert_ushort_sat_rte((x) * 65535.0f))
+    \\#else
+    \\typedef uchar io_t;
+    \\typedef uchar raw_t;
+    \\#define LOAD_IO(p, i) (convert_float((p)[i]) / 255.0f)
+    \\#define STORE_IO(p, i, x) ((p)[i] = convert_uchar_sat_rte((x) * 255.0f))
     \\#endif
     \\
     \\// mirror-reflect a horizontal index into [0,w) (fractional axis, no edge dup)
@@ -35,13 +84,35 @@ const kernel_src =
     \\// [-pad, w-1+pad]. The full multi-bounce refl is computed here ONCE per padded
     \\// column, so the hot interp loops can index out[... + (idx+pad)] with no refl.
     \\// global = (pad+w+pad, src_h).
-    \\kernel void pad_src(global float *out, global const float *src,
+    \\// The io->f32 conversion happens HERE (LOAD_IO), once per padded column — the entire
+    \\// downstream pipeline (pad_hp, costs, DP, interp reads) then works on f32 srcpad rows.
+    \\kernel void pad_src(global float *out, global const io_t *src,
     \\                    const int w, const int stride, const int pstride,
     \\                    const int pad, const int src_h) {
     \\    const int px = get_global_id(0);     // padded column [0, pad+w+pad)
     \\    const int y  = get_global_id(1);
     \\    if (px >= pad + w + pad || y >= src_h) return;
-    \\    out[y*pstride + px] = src[y*stride + refl(px - pad, w)];
+    \\    out[y*pstride + px] = LOAD_IO(src, y*stride + refl(px - pad, w));
+    \\}
+    \\
+    \\// Half-pel companion of pad_src (only used when hp=1): hpout[y][px] is the cubic
+    \\// half-pel sample between full-pel columns px and px+1 of the mirror-padded srcpad
+    \\// row. It depends ONLY on the source row (not on direction u or DP position x), so
+    \\// precomputing it once per frame removes ALL inline HP() recompute from the
+    \\// barrier-bound hp DP loop (interp_hp reads hpX[j] instead of recomputing). Same
+    \\// 0.5625/0.0625 coefficients + tap grouping as the old inline HP()/CPU computeHpRow,
+    \\// over the same padded data, so it stays bit-identical. global = (pad+w+pad, src_h).
+    \\kernel void pad_hp(global float *hpout, global const float *srcpad,
+    \\                   const int pstride, const int src_h, const int pad, const int w) {
+    \\    const int px = get_global_id(0);
+    \\    const int y  = get_global_id(1);
+    \\    const int pw = pad + w + pad;
+    \\    if (px >= pw || y >= src_h) return;
+    \\    global const float *r = srcpad + (long)y*pstride;
+    \\    float v = (px >= 1 && px + 2 <= pw - 1)
+    \\        ? 0.5625f*(r[px]+r[px+1]) - 0.0625f*(r[px-1]+r[px+2])
+    \\        : r[px];
+    \\    hpout[(long)y*pstride + px] = v;
     \\}
     \\
     \\// connection cost for output position x, direction u (matches interpLine).
@@ -68,14 +139,61 @@ const kernel_src =
     \\    return alpha * sw + beta * (float)abs(u) + one_minus_ab * v;
     \\}
     \\
+    \\// PAIRED connection cost: (cost(x,+u), cost(x,-u)) for u > 0 in one call. The two
+    \\// costs read the SAME five column-windows per row array — the index sets of +u
+    \\// ({u,-u,0,-2u,2u} + offsets k) and of -u are identical, negation only permutes
+    \\// which window feeds which term — so the 20 loads per k serve BOTH costs (vs 2x16
+    \\// separately; the cost fill is the LSU-bound 60%+ of the frame, see the strip-fill
+    \\// comment on `interp`). BIT-EXACT: each cost's accumulation statements below are
+    \\// conn_cost's statements VERBATIM (same values, same grouping, same order — swp/swm
+    \\// get their a0-, a1-, a2-group in the original per-k sequence); only WHERE the
+    \\// operands come from (a register instead of a repeated load) changes, which cannot
+    \\// alter a float. The tails replicate conn_cost's tail expression per sign.
+    \\static float2 conn_cost_pair(global const float * restrict r3p, global const float * restrict r1p,
+    \\                             global const float * restrict r1n, global const float * restrict r3n,
+    \\                             const int x, const int u, const int w, const int nrad,
+    \\                             const int pad,
+    \\                             const float alpha, const float beta, const float one_minus_ab) {
+    \\    const int two_u = 2*u;
+    \\    const int xp = x + pad;
+    \\    float swp = 0.0f, swm = 0.0f;
+    \\    #pragma unroll
+    \\    for (int k = -CN; k <= CN; k++) {
+    \\        const int p2 = xp+two_u+k, p1 = xp+u+k, c0 = xp+k, m1 = xp-u+k, m2 = xp-two_u+k;
+    \\        const float A_p2=r3p[p2], A_p1=r3p[p1], A_c0=r3p[c0], A_m1=r3p[m1], A_m2=r3p[m2];
+    \\        const float B_p2=r1p[p2], B_p1=r1p[p1], B_c0=r1p[c0], B_m1=r1p[m1], B_m2=r1p[m2];
+    \\        const float C_p2=r1n[p2], C_p1=r1n[p1], C_c0=r1n[c0], C_m1=r1n[m1], C_m2=r1n[m2];
+    \\        const float D_p2=r3n[p2], D_p1=r3n[p1], D_c0=r3n[c0], D_m1=r3n[m1], D_m2=r3n[m2];
+    \\        // +u: a0=p1 b0=m1 | a1=c0 b1=m2 | a2=p2 b2=c0   (conn_cost's three statements)
+    \\        swp += fabs(A_p1-B_m1) + fabs(B_p1-C_m1) + fabs(C_p1-D_m1);
+    \\        swp += fabs(A_c0-B_m2) + fabs(B_c0-C_m2) + fabs(C_c0-D_m2);
+    \\        swp += fabs(A_p2-B_c0) + fabs(B_p2-C_c0) + fabs(C_p2-D_c0);
+    \\        // -u: a0=m1 b0=p1 | a1=c0 b1=p2 | a2=m2 b2=c0
+    \\        swm += fabs(A_m1-B_p1) + fabs(B_m1-C_p1) + fabs(C_m1-D_p1);
+    \\        swm += fabs(A_c0-B_p2) + fabs(B_c0-C_p2) + fabs(C_c0-D_p2);
+    \\        swm += fabs(A_m2-B_c0) + fabs(B_m2-C_c0) + fabs(C_m2-D_c0);
+    \\    }
+    \\    // Tails: expression trees kept VERBATIM per sign (no shared temps in the final
+    \\    // sum — a hoisted beta*|u| could change the compiler's FMA contraction shape).
+    \\    const float b1pc = r1p[xp], b1nc = r1n[xp];
+    \\    float ipp = (r1p[xp+u] + r1n[xp-u]) * 0.5f;
+    \\    float vp = fabs(b1pc - ipp) + fabs(b1nc - ipp);
+    \\    float ipm = (r1p[xp-u] + r1n[xp+u]) * 0.5f;
+    \\    float vm = fabs(b1pc - ipm) + fabs(b1nc - ipm);
+    \\    return (float2)(alpha * swp + beta * (float)abs(u) + one_minus_ab * vp,
+    \\                    alpha * swm + beta * (float)abs(u) + one_minus_ab * vm);
+    \\}
+    \\
     \\// Copy the kept field rows from src into dst, and (when vcheck off) acts as a
-    \\// no-op for interp rows. global = (w, dst_h).
-    \\kernel void copy_kept(global float *dst, global const float *src,
+    \\// no-op for interp rows. global = (w, dst_h). raw_t: a VERBATIM bit-pattern element
+    \\// copy so kept rows are BIT-LOSSLESS for every io type (u8/u16/f16/f32 alike) — do
+    \\// NOT route this through LOAD_IO/STORE_IO (a decode+re-encode round-trip).
+    \\kernel void copy_kept(global raw_t *dst, global const raw_t *src,
     \\                      const int w, const int stride, const int dh,
-    \\                      const int field, const int src_h) {
+    \\                      const int field, const int src_h, const int dst_h) {
     \\    const int x = get_global_id(0);
     \\    const int y = get_global_id(1);
-    \\    if (x >= w) return;
+    \\    if (x >= w || y >= dst_h) return;
     \\    int is_interp, sy = -1;
     \\    if (dh) {
     \\        // kept dst rows: 2*ky + (1-field); interp rows: field, field+2, ...
@@ -90,73 +208,103 @@ const kernel_src =
     \\
     \\// One workgroup per interpolated row. local_size = padded tpitch.
     \\// rowidx[off*4 + {0,1,2,3}] = src y-index for r3p,r1p,r1n,r3n.
-    \\// dst_y[off] = destination row.  fpath is dynamic local (w ints).
-    \\kernel void interp(global float * restrict dst, global const float * restrict srcpad,
+    \\// dst_y[off] = destination row.
+    \\//
+    \\// STRIP-BATCHED DP: the conn_cost work is hoisted OUT of the barrier-locked DP loop.
+    \\// For each strip of BX x-positions, ALL lanes (not just the tpitch active ones)
+    \\// cooperatively compute the BX*TP costs into local `cst` — each lane gets several
+    \\// INDEPENDENT cost evaluations (ILP, no barrier between them) — then BX DP steps run
+    \\// with a cheap barrier each (~15 instr instead of ~230). Bit-exact: every cost(x,u) is
+    \\// still evaluated ONCE by one thread with the identical conn_cost expression (thread
+    \\// REASSIGNMENT cannot change a float); the DP combine order/pbackt bytes are untouched.
+    \\// The path array lives in the dmap row (global) instead of dynamic local — it freed 92%
+    \\// of the local budget (w ints), roughly 2.4x-ing resident workgroups per SM.
+    \\kernel void interp(global io_t * restrict dst, global const float * restrict srcpad,
     \\                   global const int * restrict rowidx, global const int * restrict dst_y,
     \\                   global char * restrict pbackt, global int * restrict dmap,
     \\                   const int w, const int stride, const int pstride, const int pad,
     \\                   const int mdis, const int nrad,
     \\                   const float alpha, const float beta, const float gamma,
-    \\                   const float one_minus_ab,
-    \\                   local int *fpath) {
+    \\                   const float one_minus_ab) {
     \\    const int off = get_global_id(1);
     \\    const int tid = get_local_id(0);
     \\    const int lsz = get_local_size(0);
-    \\    const int tpitch = 2*mdis + 1;
     \\
     \\    // PADDED rows: index [j+pad] for any j in [-pad, w-1+pad], no refl().
     \\    global const float * restrict r3p = srcpad + rowidx[off*4+0]*pstride;
     \\    global const float * restrict r1p = srcpad + rowidx[off*4+1]*pstride;
     \\    global const float * restrict r1n = srcpad + rowidx[off*4+2]*pstride;
     \\    global const float * restrict r3n = srcpad + rowidx[off*4+3]*pstride;
-    \\    global char *pb = pbackt + (long)off * w * tpitch;
+    \\    global char *pb = pbackt + (long)off * w * TP;
     \\
     \\    local float pc[2][TPMAX];
-    \\    const int u = tid - mdis;          // direction for this thread (valid if tid<tpitch)
-    \\    const int active = (tid < tpitch);
+    \\    local float cst[BX * TP];          // strip costs (TP odd => bank-conflict-free)
+    \\    const int u = tid - MDIS;          // direction for this thread (valid if tid<TP)
+    \\    const int active = (tid < TP);
     \\
     \\    // sentinels
-    \\    if (tid == 0) { pc[0][0]=FLTMAX9; pc[1][0]=FLTMAX9; pc[0][tpitch+1]=FLTMAX9; pc[1][tpitch+1]=FLTMAX9; }
+    \\    if (tid == 0) { pc[0][0]=FLTMAX9; pc[1][0]=FLTMAX9; pc[0][TP+1]=FLTMAX9; pc[1][TP+1]=FLTMAX9; }
     \\    barrier(CLK_LOCAL_MEM_FENCE);
     \\
     \\    int ping = 0;
     \\    if (active) pc[ping][tid+1] = conn_cost(r3p,r1p,r1n,r3n, 0, u, w, nrad, pad, alpha, beta, one_minus_ab);
     \\    barrier(CLK_LOCAL_MEM_FENCE);
     \\
-    \\    for (int x = 1; x < w; x++) {
-    \\        const int pong = ping ^ 1;
-    \\        if (active) {
-    \\            float cost = conn_cost(r3p,r1p,r1n,r3n, x, u, w, nrad, pad, alpha, beta, one_minus_ab);
-    \\            float left  = pc[ping][tid]   + gamma;  // dir u-1
-    \\            float cent  = pc[ping][tid+1];          // dir u
-    \\            float right = pc[ping][tid+2] + gamma;  // dir u+1
-    \\            float bval = cent; char bd = 0;
-    \\            if (left  < bval) { bval = left;  bd = -1; }
-    \\            if (right < bval) { bval = right; bd =  1; }
-    \\            pc[pong][tid+1] = fmin(bval + cost, FLTMAX9);
-    \\            pb[(x-1)*tpitch + tid] = bd;   // CPU stores backtrack delta at x-1
+    \\    #define NUNIT (MDIS + 1)   /* fill units per x: u=0 single + MDIS (+u,-u) pairs */
+    \\    for (int x0 = 1; x0 < w; x0 += BX) {
+    \\        const int bn = min(BX, w - x0);
+    \\        // cooperative fill in (+u,-u) PAIR units: both costs of a pair read the same
+    \\        // 20 values per k (see conn_cost_pair), so pairing nearly halves the fill's
+    \\        // load count — the LSU-bound bulk of this kernel. i/NUNIT is a mul-shift.
+    \\        for (int i = tid; i < bn*NUNIT; i += lsz) {
+    \\            const int dx = i / NUNIT;
+    \\            const int j  = i - dx*NUNIT;
+    \\            if (j == 0) {
+    \\                cst[dx*TP + MDIS] = conn_cost(r3p,r1p,r1n,r3n, x0+dx, 0, w, nrad, pad, alpha, beta, one_minus_ab);
+    \\            } else {
+    \\                const float2 cc = conn_cost_pair(r3p,r1p,r1n,r3n, x0+dx, j, w, nrad, pad, alpha, beta, one_minus_ab);
+    \\                cst[dx*TP + (MDIS + j)] = cc.x;
+    \\                cst[dx*TP + (MDIS - j)] = cc.y;
+    \\            }
     \\        }
     \\        barrier(CLK_LOCAL_MEM_FENCE);
-    \\        ping = pong;
-    \\    }
-    \\
-    \\    // serial backtrack: all pbackt global writes must be visible to thread 0
-    \\    barrier(CLK_GLOBAL_MEM_FENCE | CLK_LOCAL_MEM_FENCE);
-    \\    if (tid == 0) {
-    \\        fpath[w-1] = 0;
-    \\        for (int bx = w-2; bx >= 0; bx--) {
-    \\            int ui = mdis + fpath[bx+1];
-    \\            fpath[bx] = fpath[bx+1] + (int)pb[bx*tpitch + ui];
+    \\        for (int dx = 0; dx < bn; dx++) {
+    \\            const int pong = ping ^ 1;
+    \\            if (active) {
+    \\                const float cost = cst[dx*TP + tid];
+    \\                float left  = pc[ping][tid]   + gamma;  // dir u-1
+    \\                float cent  = pc[ping][tid+1];          // dir u
+    \\                float right = pc[ping][tid+2] + gamma;  // dir u+1
+    \\                float bval = cent; char bd = 0;
+    \\                if (left  < bval) { bval = left;  bd = -1; }
+    \\                if (right < bval) { bval = right; bd =  1; }
+    \\                pc[pong][tid+1] = fmin(bval + cost, FLTMAX9);
+    \\                pb[(x0+dx-1)*TP + tid] = bd;   // CPU stores backtrack delta at x-1
+    \\            }
+    \\            barrier(CLK_LOCAL_MEM_FENCE);
+    \\            ping = pong;
     \\        }
     \\    }
-    \\    barrier(CLK_LOCAL_MEM_FENCE);
     \\
-    \\    // parallel interpolate
-    \\    global float *drow = dst + dst_y[off]*stride;
+    \\    // serial backtrack: all pbackt global writes must be visible to thread 0. The path
+    \\    // goes straight into this row's dmap slice (same values the interpolate stage used
+    \\    // to store) — vcheck reads the identical dirs.
+    \\    barrier(CLK_GLOBAL_MEM_FENCE | CLK_LOCAL_MEM_FENCE);
     \\    global int *dm = dmap + (long)off*stride;
+    \\    if (tid == 0) {
+    \\        int f = 0;
+    \\        dm[w-1] = 0;
+    \\        for (int bx = w-2; bx >= 0; bx--) {
+    \\            f += (int)pb[bx*TP + (MDIS + f)];
+    \\            dm[bx] = f;
+    \\        }
+    \\    }
+    \\    barrier(CLK_GLOBAL_MEM_FENCE | CLK_LOCAL_MEM_FENCE);  // dm[] must be visible to all
+    \\
+    \\    // parallel interpolate (STORE_IO: the f32 result quantizes to the io type here)
+    \\    global io_t *drow = dst + dst_y[off]*stride;
     \\    for (int x = tid; x < w; x += lsz) {
-    \\        int dir = fpath[x];
-    \\        dm[x] = dir;
+    \\        const int dir = dm[x];
     \\        int ad = abs(dir);
     \\        const int xp = x + pad;
     \\        float val;
@@ -166,7 +314,7 @@ const kernel_src =
     \\        } else {
     \\            val = (r1p[xp+dir] + r1n[xp-dir]) * 0.5f;
     \\        }
-    \\        drow[x] = val;
+    \\        STORE_IO(drow, x, val);
     \\    }
     \\}
     \\
@@ -175,12 +323,14 @@ const kernel_src =
     \\// Rows passed to the hp helpers are PADDED rows already advanced by `pad`, so
     \\// R(row,j) is a plain row[j] (j may be negative / >= w within the pad margin).
     \\static float R(global const float * restrict row, int j) { return row[j]; }
-    \\// cubic half-pel sample between full-pel j and j+1 (matches computeHpRow)
-    \\static float HP(global const float * restrict row, int j) {
-    \\    return 0.5625f*(row[j]+row[j+1]) - 0.0625f*(row[j-1]+row[j+2]);
-    \\}
+    \\// The hp* rows are the PRECOMPUTED half-pel padded rows from pad_hp, pre-advanced by
+    \\// `pad` just like the R() rows, so hpX[j] == the old inline HP(rX,j) cubic column for
+    \\// column. The odd-u cost now just LOADS them (no per-k/per-x cubic recompute) — the
+    \\// summation order + operand grouping are unchanged, so it stays bit-identical.
     \\static float conn_cost_hp(global const float * restrict r3p, global const float * restrict r1p,
     \\                          global const float * restrict r1n, global const float * restrict r3n,
+    \\                          global const float * restrict hp3p, global const float * restrict hp1p,
+    \\                          global const float * restrict hp1n, global const float * restrict hp3n,
     \\                          const int x, const int u, const int w, const int nrad,
     \\                          const float alpha3, const float beta255, const float one_minus_ab) {
     \\    const int uh = u >> 1;
@@ -193,78 +343,176 @@ const kernel_src =
     \\        s1 += fabs(R(r3p,xk)-R(r1p,xmu)) + fabs(R(r1p,xk)-R(r1n,xmu)) + fabs(R(r1n,xk)-R(r3n,xmu));
     \\        s2 += fabs(R(r3p,xu)-R(r1p,xk)) + fabs(R(r1p,xu)-R(r1n,xk)) + fabs(R(r1n,xu)-R(r3n,xk));
     \\        if (odd)
-    \\            s0 += fabs(HP(r3p,hi)-HP(r1p,lo)) + fabs(HP(r1p,hi)-HP(r1n,lo)) + fabs(HP(r1n,hi)-HP(r3n,lo));
+    \\            s0 += fabs(hp3p[hi]-hp1p[lo]) + fabs(hp1p[hi]-hp1n[lo]) + fabs(hp1n[hi]-hp3n[lo]);
     \\        else
     \\            s0 += fabs(R(r3p,hi)-R(r1p,lo)) + fabs(R(r1p,hi)-R(r1n,lo)) + fabs(R(r1n,hi)-R(r3n,lo));
     \\    }
-    \\    float Bxuh = odd ? HP(r1p,x+uh) : R(r1p,x+uh);
-    \\    float Cxlo = odd ? HP(r1n,x+lo0) : R(r1n,x+lo0);
+    \\    float Bxuh = odd ? hp1p[x+uh] : R(r1p,x+uh);
+    \\    float Cxlo = odd ? hp1n[x+lo0] : R(r1n,x+lo0);
     \\    float ip = (Bxuh + Cxlo) * 0.5f;
     \\    float v = fabs(R(r1p,x)-ip) + fabs(R(r1n,x)-ip);
     \\    return alpha3*(s0+s1+s2) + beta255*(float)abs(u)*0.5f + one_minus_ab*v;
     \\}
     \\
-    \\kernel void interp_hp(global float * restrict dst, global const float * restrict srcpad,
+    \\// PAIRED hp cost: (cost_hp(x,+u), cost_hp(x,-u)) for u > 0 (same parity — pairs are
+    \\// formed within each parity-split fill pass, so `odd` stays warp-uniform). The two
+    \\// costs share every window: xu(+u)=xmu(-u) and, because uh(-u) = lo0(+u) and
+    \\// lo0(-u) = uh(+u) for BOTH parities (arithmetic >> like the original), the hp/full
+    \\// hi/lo windows swap sides. 20 loads per k serve both costs (vs ~2x16). BIT-EXACT:
+    \\// per sign, s0/s1/s2 accumulate the original conn_cost_hp statements VERBATIM in the
+    \\// original per-k order, and the tail expression trees are replicated per sign.
+    \\static float2 conn_cost_hp_pair(global const float * restrict r3p, global const float * restrict r1p,
+    \\                                global const float * restrict r1n, global const float * restrict r3n,
+    \\                                global const float * restrict hp3p, global const float * restrict hp1p,
+    \\                                global const float * restrict hp1n, global const float * restrict hp3n,
+    \\                                const int x, const int u, const int w, const int nrad,
+    \\                                const float alpha3, const float beta255, const float one_minus_ab) {
+    \\    const int uh = u >> 1;
+    \\    const int odd = u & 1;
+    \\    const int lo0 = odd ? (-uh - 1) : (-uh);       // == uh of -u (both parities)
+    \\    float s0p=0.0f, s1p=0.0f, s2p=0.0f;
+    \\    float s0m=0.0f, s1m=0.0f, s2m=0.0f;
+    \\    #pragma unroll
+    \\    for (int k=-CN; k<=CN; k++) {
+    \\        const int xk = x+k, hi = x+uh+k, lo = x+lo0+k, xu = x+u+k, xm = x-u+k;
+    \\        const float A0=R(r3p,xk), B0=R(r1p,xk), C0=R(r1n,xk), D0=R(r3n,xk);
+    \\        const float Au=R(r3p,xu), Bu=R(r1p,xu), Cu=R(r1n,xu), Du=R(r3n,xu);
+    \\        const float Am=R(r3p,xm), Bm=R(r1p,xm), Cm=R(r1n,xm), Dm=R(r3n,xm);
+    \\        // +u: s1 pairs xk with xmu=xm; s2 pairs xu with xk. -u: xu/xm swap roles.
+    \\        s1p += fabs(A0-Bm) + fabs(B0-Cm) + fabs(C0-Dm);
+    \\        s2p += fabs(Au-B0) + fabs(Bu-C0) + fabs(Cu-D0);
+    \\        s1m += fabs(A0-Bu) + fabs(B0-Cu) + fabs(C0-Du);
+    \\        s2m += fabs(Am-B0) + fabs(Bm-C0) + fabs(Cm-D0);
+    \\        if (odd) {
+    \\            const float h3p_h=hp3p[hi], h3p_l=hp3p[lo];
+    \\            const float h1p_h=hp1p[hi], h1p_l=hp1p[lo];
+    \\            const float h1n_h=hp1n[hi], h1n_l=hp1n[lo];
+    \\            const float h3n_h=hp3n[hi], h3n_l=hp3n[lo];
+    \\            s0p += fabs(h3p_h-h1p_l) + fabs(h1p_h-h1n_l) + fabs(h1n_h-h3n_l);
+    \\            s0m += fabs(h3p_l-h1p_h) + fabs(h1p_l-h1n_h) + fabs(h1n_l-h3n_h); // hi(-u)=lo, lo(-u)=hi
+    \\        } else {
+    \\            const float f3p_h=R(r3p,hi), f3p_l=R(r3p,lo);
+    \\            const float f1p_h=R(r1p,hi), f1p_l=R(r1p,lo);
+    \\            const float f1n_h=R(r1n,hi), f1n_l=R(r1n,lo);
+    \\            const float f3n_h=R(r3n,hi), f3n_l=R(r3n,lo);
+    \\            s0p += fabs(f3p_h-f1p_l) + fabs(f1p_h-f1n_l) + fabs(f1n_h-f3n_l);
+    \\            s0m += fabs(f3p_l-f1p_h) + fabs(f1p_l-f1n_h) + fabs(f1n_l-f3n_h);
+    \\        }
+    \\    }
+    \\    // Tails per sign, expression trees verbatim; x+uh(-u) = x+lo0, x+lo0(-u) = x+uh.
+    \\    const float b1pc = R(r1p,x), b1nc = R(r1n,x);
+    \\    float Bxuh_p = odd ? hp1p[x+uh]  : R(r1p,x+uh);
+    \\    float Cxlo_p = odd ? hp1n[x+lo0] : R(r1n,x+lo0);
+    \\    float ip_p = (Bxuh_p + Cxlo_p) * 0.5f;
+    \\    float v_p = fabs(b1pc-ip_p) + fabs(b1nc-ip_p);
+    \\    float Bxuh_m = odd ? hp1p[x+lo0] : R(r1p,x+lo0);
+    \\    float Cxlo_m = odd ? hp1n[x+uh]  : R(r1n,x+uh);
+    \\    float ip_m = (Bxuh_m + Cxlo_m) * 0.5f;
+    \\    float v_m = fabs(b1pc-ip_m) + fabs(b1nc-ip_m);
+    \\    return (float2)(alpha3*(s0p+s1p+s2p) + beta255*(float)abs(u)*0.5f + one_minus_ab*v_p,
+    \\                    alpha3*(s0m+s1m+s2m) + beta255*(float)abs(u)*0.5f + one_minus_ab*v_m);
+    \\}
+    \\
+    \\// Strip-batched exactly like `interp` (see its header comment); TPH directions, 5-way
+    \\// min, path array in the dmap row.
+    \\kernel void interp_hp(global io_t * restrict dst, global const float * restrict srcpad,
     \\                      global const int * restrict rowidx, global const int * restrict dst_y,
     \\                      global char * restrict pbackt, global int * restrict dmap,
     \\                      const int w, const int stride, const int pstride, const int pad,
     \\                      const int mdis, const int nrad,
     \\                      const float alpha3, const float beta255, const float gamma255,
-    \\                      const float one_minus_ab, local int *fpath) {
+    \\                      const float one_minus_ab,
+    \\                      global const float * restrict hpsrcpad) {
     \\    const int off = get_global_id(1);
     \\    const int tid = get_local_id(0);
     \\    const int lsz = get_local_size(0);
-    \\    const int cen = 2*mdis;
-    \\    const int tpitch = 4*mdis + 1;
+    \\    const int cen = 2*MDIS;
     \\    // PADDED rows, pre-advanced by `pad` so R(row,j)=row[j] needs no refl().
     \\    global const float * restrict r3p = srcpad + rowidx[off*4+0]*pstride + pad;
     \\    global const float * restrict r1p = srcpad + rowidx[off*4+1]*pstride + pad;
     \\    global const float * restrict r1n = srcpad + rowidx[off*4+2]*pstride + pad;
     \\    global const float * restrict r3n = srcpad + rowidx[off*4+3]*pstride + pad;
-    \\    global char *pb = pbackt + (long)off * w * tpitch;
+    \\    // Precomputed half-pel rows (pad_hp), pre-advanced by `pad` exactly like the R() rows.
+    \\    global const float * restrict hp3p = hpsrcpad + rowidx[off*4+0]*pstride + pad;
+    \\    global const float * restrict hp1p = hpsrcpad + rowidx[off*4+1]*pstride + pad;
+    \\    global const float * restrict hp1n = hpsrcpad + rowidx[off*4+2]*pstride + pad;
+    \\    global const float * restrict hp3n = hpsrcpad + rowidx[off*4+3]*pstride + pad;
+    \\    global char *pb = pbackt + (long)off * w * TPH;
     \\    local float pc[2][TPMAX_HP];
+    \\    local float cst[BX * TPH];
     \\    const int u = tid - cen;
-    \\    const int active = (tid < tpitch);
-    \\    if (tid == 0) { for (int b=0;b<2;b++){ pc[b][0]=FLTMAX9; pc[b][1]=FLTMAX9; pc[b][tpitch+2]=FLTMAX9; pc[b][tpitch+3]=FLTMAX9; } }
+    \\    const int active = (tid < TPH);
+    \\    if (tid == 0) { for (int b=0;b<2;b++){ pc[b][0]=FLTMAX9; pc[b][1]=FLTMAX9; pc[b][TPH+2]=FLTMAX9; pc[b][TPH+3]=FLTMAX9; } }
     \\    barrier(CLK_LOCAL_MEM_FENCE);
     \\    int ping = 0;
-    \\    if (active) pc[ping][tid+2] = conn_cost_hp(r3p,r1p,r1n,r3n, 0, u, w, nrad, alpha3, beta255, one_minus_ab);
+    \\    if (active) pc[ping][tid+2] = conn_cost_hp(r3p,r1p,r1n,r3n, hp3p,hp1p,hp1n,hp3n, 0, u, w, nrad, alpha3, beta255, one_minus_ab);
     \\    barrier(CLK_LOCAL_MEM_FENCE);
     \\    const float g1 = gamma255*0.5f, g2 = gamma255;
-    \\    for (int x = 1; x < w; x++) {
-    \\        const int pong = ping ^ 1;
-    \\        if (active) {
-    \\            float cost = conn_cost_hp(r3p,r1p,r1n,r3n, x, u, w, nrad, alpha3, beta255, one_minus_ab);
-    \\            float c_m2 = fmin(pc[ping][tid+0]+g2, FLTMAX9);
-    \\            float c_m1 = fmin(pc[ping][tid+1]+g1, FLTMAX9);
-    \\            float c_0  = fmin(pc[ping][tid+2],    FLTMAX9);
-    \\            float c_p1 = fmin(pc[ping][tid+3]+g1, FLTMAX9);
-    \\            float c_p2 = fmin(pc[ping][tid+4]+g2, FLTMAX9);
-    \\            float bval = c_m2; char bd = -2;
-    \\            if (c_m1 < bval) { bval = c_m1; bd = -1; }
-    \\            if (c_0  < bval) { bval = c_0;  bd =  0; }
-    \\            if (c_p1 < bval) { bval = c_p1; bd =  1; }
-    \\            if (c_p2 < bval) { bval = c_p2; bd =  2; }
-    \\            pc[pong][tid+2] = fmin(bval + cost, FLTMAX9);
-    \\            pb[(x-1)*tpitch + tid] = bd;
+    \\    for (int x0 = 1; x0 < w; x0 += BX) {
+    \\        const int bn = min(BX, w - x0);
+    \\        // PARITY-SPLIT fill in (+u,-u) PAIR units: pairs form within a parity (u and
+    \\        // -u share it), so `odd` stays provably constant per pass (the old parity
+    \\        // split's warp-uniformity win) AND both costs of a pair share their 20 loads
+    \\        // per k (conn_cost_hp_pair — the fill is the LSU-bound bulk of this kernel).
+    \\        // Every (x,u) is still computed exactly once with the identical expressions.
+    \\        #define NEVU (MDIS + 1)   /* even units: u=0 single + MDIS pairs (2j,-2j) */
+    \\        #define NODU (MDIS)       /* odd units: MDIS pairs (2j+1,-(2j+1)) */
+    \\        for (int i = tid; i < bn*NEVU; i += lsz) {         // even directions
+    \\            const int dx = i / NEVU;
+    \\            const int j  = i - dx*NEVU;
+    \\            if (j == 0) {
+    \\                cst[dx*TPH + cen] = conn_cost_hp(r3p,r1p,r1n,r3n, hp3p,hp1p,hp1n,hp3n, x0+dx, 0, w, nrad, alpha3, beta255, one_minus_ab);
+    \\            } else {
+    \\                const int uu = 2*j;
+    \\                const float2 cc = conn_cost_hp_pair(r3p,r1p,r1n,r3n, hp3p,hp1p,hp1n,hp3n, x0+dx, uu, w, nrad, alpha3, beta255, one_minus_ab);
+    \\                cst[dx*TPH + (cen + uu)] = cc.x;
+    \\                cst[dx*TPH + (cen - uu)] = cc.y;
+    \\            }
+    \\        }
+    \\        for (int i = tid; i < bn*NODU; i += lsz) {         // odd directions
+    \\            const int dx = i / NODU;
+    \\            const int j  = i - dx*NODU;
+    \\            const int uu = 2*j + 1;
+    \\            const float2 cc = conn_cost_hp_pair(r3p,r1p,r1n,r3n, hp3p,hp1p,hp1n,hp3n, x0+dx, uu, w, nrad, alpha3, beta255, one_minus_ab);
+    \\            cst[dx*TPH + (cen + uu)] = cc.x;
+    \\            cst[dx*TPH + (cen - uu)] = cc.y;
     \\        }
     \\        barrier(CLK_LOCAL_MEM_FENCE);
-    \\        ping = pong;
-    \\    }
-    \\    barrier(CLK_GLOBAL_MEM_FENCE | CLK_LOCAL_MEM_FENCE);
-    \\    if (tid == 0) {
-    \\        fpath[w-1] = 0;
-    \\        for (int bx = w-2; bx >= 0; bx--) {
-    \\            int ui = cen + fpath[bx+1];
-    \\            fpath[bx] = fpath[bx+1] + (int)pb[bx*tpitch + ui];
+    \\        for (int dx = 0; dx < bn; dx++) {
+    \\            const int pong = ping ^ 1;
+    \\            if (active) {
+    \\                const float cost = cst[dx*TPH + tid];
+    \\                float c_m2 = fmin(pc[ping][tid+0]+g2, FLTMAX9);
+    \\                float c_m1 = fmin(pc[ping][tid+1]+g1, FLTMAX9);
+    \\                float c_0  = fmin(pc[ping][tid+2],    FLTMAX9);
+    \\                float c_p1 = fmin(pc[ping][tid+3]+g1, FLTMAX9);
+    \\                float c_p2 = fmin(pc[ping][tid+4]+g2, FLTMAX9);
+    \\                float bval = c_m2; char bd = -2;
+    \\                if (c_m1 < bval) { bval = c_m1; bd = -1; }
+    \\                if (c_0  < bval) { bval = c_0;  bd =  0; }
+    \\                if (c_p1 < bval) { bval = c_p1; bd =  1; }
+    \\                if (c_p2 < bval) { bval = c_p2; bd =  2; }
+    \\                pc[pong][tid+2] = fmin(bval + cost, FLTMAX9);
+    \\                pb[(x0+dx-1)*TPH + tid] = bd;
+    \\            }
+    \\            barrier(CLK_LOCAL_MEM_FENCE);
+    \\            ping = pong;
     \\        }
     \\    }
-    \\    barrier(CLK_LOCAL_MEM_FENCE);
-    \\    global float *drow = dst + dst_y[off]*stride;
+    \\    barrier(CLK_GLOBAL_MEM_FENCE | CLK_LOCAL_MEM_FENCE);
     \\    global int *dm = dmap + (long)off*stride;
+    \\    if (tid == 0) {
+    \\        int f = 0;
+    \\        dm[w-1] = 0;
+    \\        for (int bx = w-2; bx >= 0; bx--) {
+    \\            f += (int)pb[bx*TPH + (cen + f)];
+    \\            dm[bx] = f;
+    \\        }
+    \\    }
+    \\    barrier(CLK_GLOBAL_MEM_FENCE | CLK_LOCAL_MEM_FENCE);
+    \\    global io_t *drow = dst + dst_y[off]*stride;
     \\    for (int x = tid; x < w; x += lsz) {
-    \\        int dir = fpath[x];
-    \\        dm[x] = dir;
+    \\        const int dir = dm[x];
     \\        float val;
     \\        if ((dir & 1) == 0) {
     \\            int d2 = dir >> 1; int ad = abs(d2);
@@ -285,7 +533,7 @@ const kernel_src =
     \\                val = (R(r1p,x+d20)+R(r1p,x+d21)+R(r1n,x-d20)+R(r1n,x-d21))*0.25f;
     \\            }
     \\        }
-    \\        drow[x] = val;
+    \\        STORE_IO(drow, x, val);
     \\    }
     \\}
     \\
@@ -302,8 +550,13 @@ const kernel_src =
     \\// = one workgroup; work-items grid-stride over x within each row. The host
     \\// seeds `out` (= copy of `dst`) so kept + non-vcheckable rows pass through,
     \\// and so the first row's d2p reads a valid (off=0 interp) row.
-    \\kernel void vcheck(global float *out, global const float *dst, global const float *src,
-    \\                   global const int *rowidx, global const int *dmap, global const float *scp,
+    \\// io note: vcheck runs in the IO domain end-to-end — every row it touches (the interp
+    \\// snapshot `dst`, its own output `out`, the raw source rows d3p/d3n and the sclip) is
+    \\// io_t, so all reads go through LOAD_IO and both stores through STORE_IO. The ±2-row
+    \\// feedback therefore sees the QUANTIZED previously-stored row for int/f16 io (like a
+    \\// CPU int-domain implementation); for f32 io the macros are the identity (unchanged).
+    \\kernel void vcheck(global io_t *out, global const io_t *dst, global const io_t *src,
+    \\                   global const int *rowidx, global const int *dmap, global const io_t *scp,
     \\                   const int w, const int stride, const int dst_h, const int field,
     \\                   const int n_interp, const int vmode, const int use_scp, const int hp,
     \\                   const float rcp0, const float rcp1, const float rcp2, const float vthresh2) {
@@ -312,22 +565,22 @@ const kernel_src =
     \\    for (int off = 1; off + 1 < n_interp; ++off) {
     \\        const int y = field + 2*off;
     \\        if (y >= 2 && y + 2 < dst_h) {
-    \\            global const float *drow = dst + y*stride;
-    \\            global const float *d1p = dst + (y-1)*stride;
-    \\            global const float *d2p = out + (y-2)*stride;
-    \\            global const float *d1n = dst + (y+1)*stride;
-    \\            global const float *d2n = dst + (y+2)*stride;
-    \\            global const float *d3p = src + rowidx[off*4+0]*stride;
-    \\            global const float *d3n = src + rowidx[off*4+3]*stride;
+    \\            global const io_t *drow = dst + y*stride;
+    \\            global const io_t *d1p = dst + (y-1)*stride;
+    \\            global const io_t *d2p = out + (y-2)*stride;
+    \\            global const io_t *d1n = dst + (y+1)*stride;
+    \\            global const io_t *d2n = dst + (y+2)*stride;
+    \\            global const io_t *d3p = src + rowidx[off*4+0]*stride;
+    \\            global const io_t *d3n = src + rowidx[off*4+3]*stride;
     \\            for (int x = lid; x < w; x += lsz) {
     \\                const int dirc = dmap[(long)off*stride + x];
-    \\                float cint = use_scp ? scp[y*stride + x] : (0.5625f*(d1p[x]+d1n[x]) - 0.0625f*(d3p[x]+d3n[x]));
+    \\                float cint = use_scp ? LOAD_IO(scp, y*stride + x) : (0.5625f*(LOAD_IO(d1p,x)+LOAD_IO(d1n,x)) - 0.0625f*(LOAD_IO(d3p,x)+LOAD_IO(d3n,x)));
     \\                int dirt = dmap[(long)(off-1)*stride + x];
     \\                int dirb = dmap[(long)(off+1)*stride + x];
     \\                int maxoff = hp ? ((dirc & 1) == 0 ? abs(dirc>>1) : max(abs(dirc>>1), abs((dirc+1)>>1))) : abs(dirc);
     \\                if (dirc == 0 || max(dirc*dirt, dirc*dirb) < 0 || (dirt==dirb && dirt==0)
     \\                    || x + maxoff >= w || x - maxoff < 0) {
-    \\                    out[y*stride + x] = cint;
+    \\                    STORE_IO(out, y*stride + x, cint);
     \\                    continue;
     \\                }
     \\                float it, ib, vt, vb;
@@ -335,9 +588,9 @@ const kernel_src =
     \\                if (hp && (dirc & 1) != 0) {
     \\                    int d20 = dirc>>1, d21 = (dirc+1)>>1;
     \\                    int xp0 = x+d20, xp1 = x+d21, xm0 = x-d20, xm1 = x-d21;
-    \\                    float s2psum = d2p[xp0]+d2p[xp1], s1psum = d1p[xp0]+d1p[xp1];
-    \\                    float pa0 = drow[xp0]+drow[xp1], ps0 = drow[xm0]+drow[xm1];
-    \\                    float s1nsum = d1n[xm0]+d1n[xm1], s2nsum = d2n[xm0]+d2n[xm1];
+    \\                    float s2psum = LOAD_IO(d2p,xp0)+LOAD_IO(d2p,xp1), s1psum = LOAD_IO(d1p,xp0)+LOAD_IO(d1p,xp1);
+    \\                    float pa0 = LOAD_IO(drow,xp0)+LOAD_IO(drow,xp1), ps0 = LOAD_IO(drow,xm0)+LOAD_IO(drow,xm1);
+    \\                    float s1nsum = LOAD_IO(d1n,xm0)+LOAD_IO(d1n,xm1), s2nsum = LOAD_IO(d2n,xm0)+LOAD_IO(d2n,xm1);
     \\                    it = (s2psum + ps0)*0.25f;
     \\                    vt = (fabs(s2psum-s1psum) + fabs(pa0-s1psum))*0.5f;
     \\                    ib = (pa0 + s2nsum)*0.25f;
@@ -346,20 +599,20 @@ const kernel_src =
     \\                } else {
     \\                    int offh = hp ? (dirc>>1) : dirc;
     \\                    int xpd = x+offh, xmd = x-offh;
-    \\                    it = (d2p[xpd] + drow[xmd]) * 0.5f;
-    \\                    ib = (drow[xpd] + d2n[xmd]) * 0.5f;
-    \\                    vt = fabs(d2p[xpd]-d1p[xpd]) + fabs(drow[xpd]-d1p[xpd]);
-    \\                    vb = fabs(d2n[xmd]-d1n[xmd]) + fabs(drow[xmd]-d1n[xmd]);
+    \\                    it = (LOAD_IO(d2p,xpd) + LOAD_IO(drow,xmd)) * 0.5f;
+    \\                    ib = (LOAD_IO(drow,xpd) + LOAD_IO(d2n,xmd)) * 0.5f;
+    \\                    vt = fabs(LOAD_IO(d2p,xpd)-LOAD_IO(d1p,xpd)) + fabs(LOAD_IO(drow,xpd)-LOAD_IO(d1p,xpd));
+    \\                    vb = fabs(LOAD_IO(d2n,xmd)-LOAD_IO(d1n,xmd)) + fabs(LOAD_IO(drow,xmd)-LOAD_IO(d1n,xmd));
     \\                    dabs = hp ? (abs(dirc)>>1) : abs(dirc);
     \\                }
-    \\                float vc = fabs(drow[x]-d1p[x]) + fabs(drow[x]-d1n[x]);
-    \\                float d0 = fabs(it-d1p[x]), d1 = fabs(ib-d1n[x]), d2 = fabs(vt-vc), d3 = fabs(vb-vc);
+    \\                float vc = fabs(LOAD_IO(drow,x)-LOAD_IO(d1p,x)) + fabs(LOAD_IO(drow,x)-LOAD_IO(d1n,x));
+    \\                float d0 = fabs(it-LOAD_IO(d1p,x)), d1 = fabs(ib-LOAD_IO(d1n,x)), d2 = fabs(vt-vc), d3 = fabs(vb-vc);
     \\                float mdiff0 = (vmode==1)?fmin(d0,d1):(vmode==2)?(d0+d1)*0.5f:fmax(d0,d1);
     \\                float mdiff1 = (vmode==1)?fmin(d2,d3):(vmode==2)?(d2+d3)*0.5f:fmax(d2,d3);
     \\                float a0 = mdiff0*rcp0, a1 = mdiff1*rcp1;
     \\                float a2 = fmax((vthresh2 - (float)dabs)*rcp2, 0.0f);
     \\                float a = fmin(fmax(a0, fmax(a1,a2)), 1.0f);
-    \\                out[y*stride + x] = (1.0f-a)*drow[x] + a*cint;
+    \\                STORE_IO(out, y*stride + x, (1.0f-a)*LOAD_IO(drow,x) + a*cint);
     \\            }
     \\        }
     \\        barrier(CLK_GLOBAL_MEM_FENCE);
@@ -367,15 +620,41 @@ const kernel_src =
     \\}
     \\
     \\// out[c*out_stride + r] = in[r*in_stride + c], for r<in_h, c<in_w. global=(in_w,in_h).
-    \\kernel void transpose(global float *out, global const float *in,
-    \\                      const int in_w, const int in_h, const int in_stride, const int out_stride) {
-    \\    const int c = get_global_id(0);
-    \\    const int r = get_global_id(1);
-    \\    if (c >= in_w || r >= in_h) return;
-    \\    out[c*out_stride + r] = in[r*in_stride + c];
+    \\// Local-tiled (16x16, +1 col to break bank conflicts): reads AND writes are coalesced
+    \\// (the naive version wrote out[c*out_stride + r] with c varying per lane — one 32B
+    \\// transaction per lane). Pure permutation of the same values — bit-exact trivially.
+    \\// raw_t: transpose sits on the RAW ingress/egress/sclip paths (EEDI3H), so it moves io
+    \\// elements as bit patterns (avoids declaring `half` objects, which core CL forbids).
+    \\kernel __attribute__((reqd_work_group_size(16, 16, 1)))
+    \\void transpose(global raw_t *out, global const raw_t *in,
+    \\               const int in_w, const int in_h, const int in_stride, const int out_stride) {
+    \\    local raw_t tile[16][17];
+    \\    const int lx = get_local_id(0), ly = get_local_id(1);
+    \\    const int c0 = get_group_id(0) * 16, r0 = get_group_id(1) * 16;
+    \\    const int c = c0 + lx, r = r0 + ly;
+    \\    if (c < in_w && r < in_h) tile[ly][lx] = in[r*in_stride + c];
+    \\    barrier(CLK_LOCAL_MEM_FENCE);
+    \\    // write transposed: lane lx walks r (coalesced along out rows)
+    \\    const int oc = c0 + ly, orr = r0 + lx;
+    \\    if (oc < in_w && orr < in_h) out[oc*out_stride + orr] = tile[lx][ly];
     \\}
     \\
 ;
+
+const max_cfg = 2;
+const Config = struct {
+    w: u32,
+    src_h: u32,
+    dst_h: u32,
+    stride: u32,
+    pstride: u32,
+    n_interp_max: u32,
+    in_w: u32 = 0,
+    in_h: u32 = 0,
+    out_w: u32 = 0,
+    in_stride: u32 = 0,
+    out_stride: u32 = 0,
+};
 
 const Data = struct {
     node: ?*vs.Node = null,
@@ -384,6 +663,9 @@ const Data = struct {
 
     horizontal: bool = false,
     hp: bool = false,
+    bits: i32 = 32,
+    half: bool = false,
+    bytes: u32 = 4,
     field: u8 = 0,
     dh: bool = false,
     mdis: u8 = 0,
@@ -398,61 +680,53 @@ const Data = struct {
     rcp2: f32 = 0,
     vthresh2: f32 = 0,
 
-    // dimensions of the plane-0 src/dst (vertical orientation)
-    w: u32 = 0,
-    src_h: u32 = 0,
-    dst_h: u32 = 0,
-    stride: u32 = 0,
-    n_interp: u32 = 0,
+    configs: [max_cfg]Config = undefined,
+    n_cfg: usize = 0,
+    plane_cfg: [3]usize = .{ 0, 0, 0 },
+    rowidx_host: [max_cfg][2][]i32 = undefined,
+    dsty_host: [max_cfg][2][]i32 = undefined,
+
     tpitch: u32 = 0,
     lws: usize = 0,
-    max_wg: usize = 256, // device CL_DEVICE_MAX_WORK_GROUP_SIZE (caps the vcheck workgroup)
-
-    // horizontal mirror-pad margin (covers max interp/cost reach) + padded stride
+    max_wg: usize = 256,
     pad: u32 = 0,
-    pstride: u32 = 0,
-
-    // EEDI3H (transpose) only: input/output frame dims (untransposed)
-    in_w: u32 = 0, // = src_h
-    in_h: u32 = 0, // = w
-    out_w: u32 = 0, // = dst_h
-    in_stride: u32 = 0,
-    out_stride: u32 = 0,
-
     platform: cl.Platform = undefined,
     device: cl.Device = undefined,
+    context: cl.Context = undefined,
     pool: clpool.Pool(Stream, Data) = .{},
 };
 
 const Stream = struct {
-    context: cl.Context,
     program: cl.Program,
     queue: cl.CommandQueue,
-    d_src: cl.Buffer(f32),
+    d_src: cl.Buffer(u8),
     d_srcpad: cl.Buffer(f32),
-    d_dst: cl.Buffer(f32),
+    d_hpsrcpad: cl.Buffer(f32),
+    d_dst: cl.Buffer(u8),
     d_rowidx: cl.Buffer(i32),
     d_dsty: cl.Buffer(i32),
     d_pbackt: cl.Buffer(i8),
     d_dmap: cl.Buffer(i32),
-    d_dst2: cl.Buffer(f32),
-    d_inframe: cl.Buffer(f32),
-    d_outframe: cl.Buffer(f32),
-    d_scp: cl.Buffer(f32),
-    d_scpframe: cl.Buffer(f32),
-    k_copy: cl.Kernel,
-    k_pad: cl.Kernel,
-    k_interp: cl.Kernel,
-    k_interp_hp: cl.Kernel,
-    k_vcheck: cl.Kernel,
+    d_dst2: cl.Buffer(u8),
+    d_inframe: cl.Buffer(u8),
+    d_outframe: cl.Buffer(u8),
+    d_scp: cl.Buffer(u8),
+    d_scpframe: cl.Buffer(u8),
+    k_copy: [max_cfg]cl.Kernel,
+    k_pad: [max_cfg]cl.Kernel,
+    k_pad_hp: [max_cfg]cl.Kernel,
+    k_interp: [max_cfg]cl.Kernel,
+    k_interp_hp: [max_cfg]cl.Kernel,
+    k_vcheck: [max_cfg]cl.Kernel,
     k_transpose: cl.Kernel,
+    n_kern_cfg: usize,
 
     pub fn init(self: *Stream, d: *Data) !void {
-        self.context = try cl.createContext(&.{d.device}, .{ .platform = d.platform });
-        errdefer self.context.release();
-        self.program = try cl.createProgramWithSource(self.context, kernel_src);
+        self.n_kern_cfg = 0;
+        self.program = try cl.createProgramWithSource(d.context, kernel_src);
         errdefer self.program.release();
-        const build_opts = try std.fmt.allocPrintSentinel(allocator, "-cl-std=CL3.0 -DCN={d}", .{d.nrad}, 0);
+        const bx: u32 = if (d.hp) 16 else 32;
+        const build_opts = try std.fmt.allocPrintSentinel(allocator, "-cl-std=CL3.0 -DCN={d} -DMDIS={d} -DBX={d} -DBITS={d} -DHALF={d}", .{ d.nrad, d.mdis, bx, d.bits, @intFromBool(d.half) }, 0);
         defer allocator.free(build_opts);
         self.program.build(&.{d.device}, build_opts) catch |err| {
             if (err == error.BuildProgramFailure) {
@@ -462,77 +736,103 @@ const Stream = struct {
             }
             return err;
         };
-        self.queue = try cl.createCommandQueue(self.context, d.device, .{});
+        self.queue = try cl.createCommandQueue(d.context, d.device, .{});
         errdefer self.queue.release();
-        self.d_src = try cl.createBuffer(f32, self.context, .{ .read_only = true }, d.stride * d.src_h);
+        const c0 = &d.configs[0];
+        const bytes: usize = d.bytes;
+        self.d_src = try cl.createBuffer(u8, d.context, .{ .read_only = true }, @as(usize, c0.stride) * c0.src_h * bytes);
         errdefer self.d_src.release();
-        self.d_srcpad = try cl.createBuffer(f32, self.context, .{ .read_write = true }, d.pstride * d.src_h);
+        self.d_srcpad = try cl.createBuffer(f32, d.context, .{ .read_write = true }, c0.pstride * c0.src_h);
         errdefer self.d_srcpad.release();
-        self.d_dst = try cl.createBuffer(f32, self.context, .{ .read_write = true }, d.stride * d.dst_h);
+        self.d_hpsrcpad = try cl.createBuffer(f32, d.context, .{ .read_write = true }, if (d.hp) c0.pstride * c0.src_h else 1);
+        errdefer self.d_hpsrcpad.release();
+        self.d_dst = try cl.createBuffer(u8, d.context, .{ .read_write = true }, @as(usize, c0.stride) * c0.dst_h * bytes);
         errdefer self.d_dst.release();
-        self.d_rowidx = try cl.createBuffer(i32, self.context, .{ .read_only = true }, d.n_interp * 4);
+        self.d_rowidx = try cl.createBuffer(i32, d.context, .{ .read_only = true }, c0.n_interp_max * 4);
         errdefer self.d_rowidx.release();
-        self.d_dsty = try cl.createBuffer(i32, self.context, .{ .read_only = true }, d.n_interp);
+        self.d_dsty = try cl.createBuffer(i32, d.context, .{ .read_only = true }, c0.n_interp_max);
         errdefer self.d_dsty.release();
-        self.d_pbackt = try cl.createBuffer(i8, self.context, .{ .read_write = true }, @as(usize, d.n_interp) * d.w * d.tpitch);
+        self.d_pbackt = try cl.createBuffer(i8, d.context, .{ .read_write = true }, @as(usize, c0.n_interp_max) * c0.w * d.tpitch);
         errdefer self.d_pbackt.release();
-        self.d_dmap = try cl.createBuffer(i32, self.context, .{ .read_write = true }, @as(usize, d.n_interp) * d.stride);
+        self.d_dmap = try cl.createBuffer(i32, d.context, .{ .read_write = true }, @as(usize, c0.n_interp_max) * c0.stride);
         errdefer self.d_dmap.release();
-        self.d_dst2 = try cl.createBuffer(f32, self.context, .{ .read_write = true }, if (d.vcheck > 0) d.stride * d.dst_h else 1);
+        self.d_dst2 = try cl.createBuffer(u8, d.context, .{ .read_write = true }, if (d.vcheck > 0) @as(usize, c0.stride) * c0.dst_h * bytes else 1);
         errdefer self.d_dst2.release();
-        self.d_inframe = try cl.createBuffer(f32, self.context, .{ .read_write = true }, if (d.horizontal) d.in_stride * d.in_h else 1);
+        self.d_inframe = try cl.createBuffer(u8, d.context, .{ .read_write = true }, if (d.horizontal) @as(usize, c0.in_stride) * c0.in_h * bytes else 1);
         errdefer self.d_inframe.release();
-        self.d_outframe = try cl.createBuffer(f32, self.context, .{ .read_write = true }, if (d.horizontal) d.out_stride * d.in_h else 1);
+        self.d_outframe = try cl.createBuffer(u8, d.context, .{ .read_write = true }, if (d.horizontal) @as(usize, c0.out_stride) * c0.in_h * bytes else 1);
         errdefer self.d_outframe.release();
         const have_scp = d.sclip != null and d.vcheck > 0;
-        self.d_scp = try cl.createBuffer(f32, self.context, .{ .read_write = true }, if (have_scp) d.stride * d.dst_h else 1);
+        self.d_scp = try cl.createBuffer(u8, d.context, .{ .read_write = true }, if (have_scp) @as(usize, c0.stride) * c0.dst_h * bytes else 1);
         errdefer self.d_scp.release();
-        self.d_scpframe = try cl.createBuffer(f32, self.context, .{ .read_write = true }, if (have_scp and d.horizontal) d.out_stride * d.in_h else 1);
+        self.d_scpframe = try cl.createBuffer(u8, d.context, .{ .read_write = true }, if (have_scp and d.horizontal) @as(usize, c0.out_stride) * c0.in_h * bytes else 1);
         errdefer self.d_scpframe.release();
-        self.k_copy = try cl.createKernel(self.program, "copy_kept");
-        errdefer self.k_copy.release();
-        self.k_pad = try cl.createKernel(self.program, "pad_src");
-        errdefer self.k_pad.release();
-        self.k_interp = try cl.createKernel(self.program, "interp");
-        errdefer self.k_interp.release();
-        self.k_interp_hp = try cl.createKernel(self.program, "interp_hp");
-        errdefer self.k_interp_hp.release();
-        self.k_vcheck = try cl.createKernel(self.program, "vcheck");
-        errdefer self.k_vcheck.release();
+
+        errdefer self.releaseKernels();
+        for (0..d.n_cfg) |ci| {
+            self.k_copy[ci] = try cl.createKernel(self.program, "copy_kept");
+            errdefer self.k_copy[ci].release();
+            self.k_pad[ci] = try cl.createKernel(self.program, "pad_src");
+            errdefer self.k_pad[ci].release();
+            self.k_pad_hp[ci] = try cl.createKernel(self.program, "pad_hp");
+            errdefer self.k_pad_hp[ci].release();
+            self.k_interp[ci] = try cl.createKernel(self.program, "interp");
+            errdefer self.k_interp[ci].release();
+            self.k_interp_hp[ci] = try cl.createKernel(self.program, "interp_hp");
+            errdefer self.k_interp_hp[ci].release();
+            self.k_vcheck[ci] = try cl.createKernel(self.program, "vcheck");
+            errdefer self.k_vcheck[ci].release();
+            try self.setStaticArgs(d, ci);
+            self.n_kern_cfg = ci + 1;
+        }
         self.k_transpose = try cl.createKernel(self.program, "transpose");
-        try self.setStaticArgs(d);
     }
 
-    // Set all immutable kernel args ONCE (this Stream owns its kernels for life and
-    // is used by one frame at a time, so OpenCL's sticky arg state carries them
-    // frame-to-frame). Only `field` (copy_kept arg 5, vcheck arg 9) varies per frame
-    // and is re-set in process(); the transpose kernel is reused per-call with
-    // different buffers so its args stay in runTranspose. Buffer CONTENTS change per
-    // frame (re-uploaded), but the buffer-handle args are fixed per Stream.
-    fn setStaticArgs(self: *Stream, d: *Data) !void {
-        const w: c_int = @intCast(d.w);
-        const stride: c_int = @intCast(d.stride);
-        const src_h_i: c_int = @intCast(d.src_h);
+    fn releaseKernels(self: *Stream) void {
+        var i: usize = self.n_kern_cfg;
+        while (i > 0) {
+            i -= 1;
+            self.k_vcheck[i].release();
+            self.k_interp_hp[i].release();
+            self.k_interp[i].release();
+            self.k_pad_hp[i].release();
+            self.k_pad[i].release();
+            self.k_copy[i].release();
+        }
+    }
 
-        // pad_src
-        try self.k_pad.setArg(@TypeOf(self.d_srcpad), 0, self.d_srcpad);
-        try self.k_pad.setArg(@TypeOf(self.d_src), 1, self.d_src);
-        try self.k_pad.setArg(c_int, 2, w);
-        try self.k_pad.setArg(c_int, 3, stride);
-        try self.k_pad.setArg(c_int, 4, @intCast(d.pstride));
-        try self.k_pad.setArg(c_int, 5, @intCast(d.pad));
-        try self.k_pad.setArg(c_int, 6, src_h_i);
+    fn setStaticArgs(self: *Stream, d: *Data, ci: usize) !void {
+        const cfg = &d.configs[ci];
+        const w: c_int = @intCast(cfg.w);
+        const stride: c_int = @intCast(cfg.stride);
+        const src_h_i: c_int = @intCast(cfg.src_h);
 
-        // copy_kept (arg 5 = field is per-frame)
-        try self.k_copy.setArg(@TypeOf(self.d_dst), 0, self.d_dst);
-        try self.k_copy.setArg(@TypeOf(self.d_src), 1, self.d_src);
-        try self.k_copy.setArg(c_int, 2, w);
-        try self.k_copy.setArg(c_int, 3, stride);
-        try self.k_copy.setArg(c_int, 4, @intFromBool(d.dh));
-        try self.k_copy.setArg(c_int, 6, src_h_i);
+        try self.k_pad[ci].setArg(@TypeOf(self.d_srcpad), 0, self.d_srcpad);
+        try self.k_pad[ci].setArg(@TypeOf(self.d_src), 1, self.d_src);
+        try self.k_pad[ci].setArg(c_int, 2, w);
+        try self.k_pad[ci].setArg(c_int, 3, stride);
+        try self.k_pad[ci].setArg(c_int, 4, @intCast(cfg.pstride));
+        try self.k_pad[ci].setArg(c_int, 5, @intCast(d.pad));
+        try self.k_pad[ci].setArg(c_int, 6, src_h_i);
 
-        // interp / interp_hp (no field arg; all immutable, incl. the dynamic __local)
-        const ik = if (d.hp) self.k_interp_hp else self.k_interp;
+        if (d.hp) {
+            try self.k_pad_hp[ci].setArg(@TypeOf(self.d_hpsrcpad), 0, self.d_hpsrcpad);
+            try self.k_pad_hp[ci].setArg(@TypeOf(self.d_srcpad), 1, self.d_srcpad);
+            try self.k_pad_hp[ci].setArg(c_int, 2, @intCast(cfg.pstride));
+            try self.k_pad_hp[ci].setArg(c_int, 3, src_h_i);
+            try self.k_pad_hp[ci].setArg(c_int, 4, @intCast(d.pad));
+            try self.k_pad_hp[ci].setArg(c_int, 5, w);
+        }
+
+        try self.k_copy[ci].setArg(@TypeOf(self.d_dst), 0, self.d_dst);
+        try self.k_copy[ci].setArg(@TypeOf(self.d_src), 1, self.d_src);
+        try self.k_copy[ci].setArg(c_int, 2, w);
+        try self.k_copy[ci].setArg(c_int, 3, stride);
+        try self.k_copy[ci].setArg(c_int, 4, @intFromBool(d.dh));
+        try self.k_copy[ci].setArg(c_int, 6, src_h_i);
+        try self.k_copy[ci].setArg(c_int, 7, @intCast(cfg.dst_h));
+
+        const ik = if (d.hp) self.k_interp_hp[ci] else self.k_interp[ci];
         try ik.setArg(@TypeOf(self.d_dst), 0, self.d_dst);
         try ik.setArg(@TypeOf(self.d_srcpad), 1, self.d_srcpad);
         try ik.setArg(@TypeOf(self.d_rowidx), 2, self.d_rowidx);
@@ -541,7 +841,7 @@ const Stream = struct {
         try ik.setArg(@TypeOf(self.d_dmap), 5, self.d_dmap);
         try ik.setArg(c_int, 6, w);
         try ik.setArg(c_int, 7, stride);
-        try ik.setArg(c_int, 8, @intCast(d.pstride));
+        try ik.setArg(c_int, 8, @intCast(cfg.pstride));
         try ik.setArg(c_int, 9, @intCast(d.pad));
         try ik.setArg(c_int, 10, @intCast(d.mdis));
         try ik.setArg(c_int, 11, @intCast(d.nrad));
@@ -549,38 +849,34 @@ const Stream = struct {
         try ik.setArg(f32, 13, d.beta);
         try ik.setArg(f32, 14, d.gamma);
         try ik.setArg(f32, 15, d.one_minus_ab);
-        if (cl.c.clSetKernelArg(ik.handle, 16, d.w * @sizeOf(i32), null) != cl.c.CL_SUCCESS) return error.SetKernelArg;
+        if (d.hp) {
+            try ik.setArg(@TypeOf(self.d_hpsrcpad), 16, self.d_hpsrcpad);
+        }
 
-        // vcheck (arg 9 = field is per-frame; use_scp is constant). Only used when on.
         if (d.vcheck > 0) {
             const use_scp: c_int = if (d.sclip != null) 1 else 0;
-            try self.k_vcheck.setArg(@TypeOf(self.d_dst2), 0, self.d_dst2);
-            try self.k_vcheck.setArg(@TypeOf(self.d_dst), 1, self.d_dst);
-            try self.k_vcheck.setArg(@TypeOf(self.d_src), 2, self.d_src);
-            try self.k_vcheck.setArg(@TypeOf(self.d_rowidx), 3, self.d_rowidx);
-            try self.k_vcheck.setArg(@TypeOf(self.d_dmap), 4, self.d_dmap);
-            try self.k_vcheck.setArg(@TypeOf(self.d_scp), 5, self.d_scp);
-            try self.k_vcheck.setArg(c_int, 6, w);
-            try self.k_vcheck.setArg(c_int, 7, stride);
-            try self.k_vcheck.setArg(c_int, 8, @intCast(d.dst_h));
-            try self.k_vcheck.setArg(c_int, 10, @intCast(d.n_interp));
-            try self.k_vcheck.setArg(c_int, 11, @intCast(d.vcheck));
-            try self.k_vcheck.setArg(c_int, 12, use_scp);
-            try self.k_vcheck.setArg(c_int, 13, @intFromBool(d.hp));
-            try self.k_vcheck.setArg(f32, 14, d.rcp0);
-            try self.k_vcheck.setArg(f32, 15, d.rcp1);
-            try self.k_vcheck.setArg(f32, 16, d.rcp2);
-            try self.k_vcheck.setArg(f32, 17, d.vthresh2);
+            try self.k_vcheck[ci].setArg(@TypeOf(self.d_dst2), 0, self.d_dst2);
+            try self.k_vcheck[ci].setArg(@TypeOf(self.d_dst), 1, self.d_dst);
+            try self.k_vcheck[ci].setArg(@TypeOf(self.d_src), 2, self.d_src);
+            try self.k_vcheck[ci].setArg(@TypeOf(self.d_rowidx), 3, self.d_rowidx);
+            try self.k_vcheck[ci].setArg(@TypeOf(self.d_dmap), 4, self.d_dmap);
+            try self.k_vcheck[ci].setArg(@TypeOf(self.d_scp), 5, self.d_scp);
+            try self.k_vcheck[ci].setArg(c_int, 6, w);
+            try self.k_vcheck[ci].setArg(c_int, 7, stride);
+            try self.k_vcheck[ci].setArg(c_int, 8, @intCast(cfg.dst_h));
+            try self.k_vcheck[ci].setArg(c_int, 11, @intCast(d.vcheck));
+            try self.k_vcheck[ci].setArg(c_int, 12, use_scp);
+            try self.k_vcheck[ci].setArg(c_int, 13, @intFromBool(d.hp));
+            try self.k_vcheck[ci].setArg(f32, 14, d.rcp0);
+            try self.k_vcheck[ci].setArg(f32, 15, d.rcp1);
+            try self.k_vcheck[ci].setArg(f32, 16, d.rcp2);
+            try self.k_vcheck[ci].setArg(f32, 17, d.vthresh2);
         }
     }
 
     pub fn deinit(self: *Stream) void {
         self.k_transpose.release();
-        self.k_vcheck.release();
-        self.k_interp_hp.release();
-        self.k_interp.release();
-        self.k_pad.release();
-        self.k_copy.release();
+        self.releaseKernels();
         self.d_scpframe.release();
         self.d_scp.release();
         self.d_outframe.release();
@@ -591,11 +887,11 @@ const Stream = struct {
         self.d_dsty.release();
         self.d_rowidx.release();
         self.d_dst.release();
+        self.d_hpsrcpad.release();
         self.d_srcpad.release();
         self.d_src.release();
         self.queue.release();
         self.program.release();
-        self.context.release();
     }
 };
 
@@ -609,135 +905,93 @@ fn reflectRow(y: i32, h: i32) u32 {
     return @intCast(r);
 }
 
-fn initOpenCL(d: *Data) !void {
-    const platforms = try cl.getPlatforms(allocator);
-    defer allocator.free(platforms);
-    if (platforms.len == 0) return error.NoPlatforms;
-    const platform = platforms[0];
-    const devices = try platform.getDevices(allocator, cl.DeviceType.all);
-    defer allocator.free(devices);
-    if (devices.len == 0) return error.NoDevices;
-    d.device = devices[0];
-    // Cap the single-workgroup vcheck launch at the device limit — a hardcoded
-    // 1024 would error (CL_INVALID_WORK_GROUP_SIZE) on devices whose max WG < 1024
-    // (CPU runtimes, some iGPUs). vcheck grid-strides over x, so a smaller WG is
-    // still correct, just fewer warps to hide the inter-row latency.
+fn stencilRow(yy: i32, sh: i32, dh: bool) i32 {
+    return @intCast(if (dh) reflectRow(yy, 2 * sh) / 2 else reflectRow(yy, sh));
+}
+
+fn initOpenCL(d: *Data, device_id: usize) !void {
+    try vszipcl.initContext(d, device_id);
     var dev_max_wg: usize = 0;
     if (cl.c.clGetDeviceInfo(d.device.id, cl.c.CL_DEVICE_MAX_WORK_GROUP_SIZE, @sizeOf(usize), &dev_max_wg, null) == cl.c.CL_SUCCESS and dev_max_wg > 0) {
         d.max_wg = dev_max_wg;
     }
-    d.platform = platform;
 }
 
-fn process(d: *Data, s: *Stream, dstp: []f32, srcp: []const f32, scpp: ?[]const f32, field: u8) !void {
-    const w: i32 = @intCast(d.w);
-    const src_h_i: i32 = @intCast(d.src_h);
-    const none: []const cl.Event = &.{};
+const ndr = vszipcl.ndr;
+fn writeBuf(comptime T: type, s: *Stream, buf: cl.Buffer(T), src: []const T) !void {
+    return vszipcl.enqWrite(s.queue, buf.handle, 0, std.mem.sliceAsBytes(src));
+}
+fn readBuf(comptime T: type, s: *Stream, buf: cl.Buffer(T), dst: []T) !void {
+    return vszipcl.enqRead(s.queue, buf.handle, 0, std.mem.sliceAsBytes(dst));
+}
 
-    // Per-frame: source row indices for the 4 stencil rows of each interp row.
-    var rowidx = try allocator.alloc(i32, d.n_interp * 4);
-    defer allocator.free(rowidx);
-    var dsty = try allocator.alloc(i32, d.n_interp);
-    defer allocator.free(dsty);
+fn process(d: *Data, s: *Stream, ci: usize, dstp: []u8, srcp: []const u8, scpp: ?[]const u8, field: u8, sync: bool) !void {
+    const cfg = &d.configs[ci];
+    const n_interp: u32 = (cfg.dst_h - field + 1) / 2;
+    errdefer _ = cl.c.clFinish(s.queue.handle);
 
-    var off: u32 = 0;
-    var iy: i32 = field;
-    while (off < d.n_interp) : (off += 1) {
-        const r = struct {
-            fn f(yy: i32, sh: i32, dh: bool) i32 {
-                return @intCast(if (dh) reflectRow(yy, 2 * sh) / 2 else reflectRow(yy, sh));
-            }
-        }.f;
-        rowidx[off * 4 + 0] = r(iy - 3, src_h_i, d.dh);
-        rowidx[off * 4 + 1] = r(iy - 1, src_h_i, d.dh);
-        rowidx[off * 4 + 2] = r(iy + 1, src_h_i, d.dh);
-        rowidx[off * 4 + 3] = r(iy + 3, src_h_i, d.dh);
-        dsty[off] = iy;
-        iy += 2;
-    }
+    try writeBuf(i32, s, s.d_rowidx, d.rowidx_host[ci][field & 1]);
+    try writeBuf(i32, s, s.d_dsty, d.dsty_host[ci][field & 1]);
 
-    // Commands run on an in-order queue, so each implicitly waits for the prior.
-    (try s.queue.enqueueWriteBuffer(i32, s.d_rowidx, false, 0, rowidx, none)).release();
-    (try s.queue.enqueueWriteBuffer(i32, s.d_dsty, false, 0, dsty, none)).release();
-
-    // Get src into d_src (transpose the frame into column-major for EEDI3H).
     if (d.horizontal) {
-        (try s.queue.enqueueWriteBuffer(f32, s.d_inframe, false, 0, srcp, none)).release();
-        try runTranspose(s, s.d_src, s.d_inframe, d.in_w, d.in_h, d.in_stride, d.stride);
+        try writeBuf(u8, s, s.d_inframe, srcp);
+        try runTranspose(s, s.d_src, s.d_inframe, cfg.in_w, cfg.in_h, cfg.in_stride, cfg.stride);
     } else {
-        (try s.queue.enqueueWriteBuffer(f32, s.d_src, false, 0, srcp, none)).release();
+        try writeBuf(u8, s, s.d_src, srcp);
     }
 
-    // Build the horizontally mirror-padded source once, so interp/interp_hp can
-    // read contiguous padded memory with no per-access refl() in the hot loop.
-    // (immutable kernel args set once in Stream.setStaticArgs)
-    const pad_gws: [2]usize = .{ vsh.ceilN(@as(usize, d.pad) * 2 + d.w, 16), d.src_h };
-    const pad_lws: [2]usize = .{ 16, 1 };
-    (try s.queue.enqueueNDRangeKernel(s.k_pad, null, &pad_gws, &pad_lws, none)).release();
+    const pad_gws: [2]usize = .{ vsh.ceilN(@as(usize, d.pad) * 2 + cfg.w, 16), vsh.ceilN(@as(usize, cfg.src_h), 8) };
+    const pad_lws: [2]usize = .{ 16, 8 };
+    try ndr(s, s.k_pad[ci], &pad_gws, &pad_lws);
+    if (d.hp) try ndr(s, s.k_pad_hp[ci], &pad_gws, &pad_lws);
 
-    // copy kept field rows (only `field` is per-frame; other args set in init)
-    try s.k_copy.setArg(c_int, 5, field);
-    const copy_gws: [2]usize = .{ vsh.ceilN(@intCast(w), 16), d.dst_h };
-    const copy_lws: [2]usize = .{ 16, 1 };
-    (try s.queue.enqueueNDRangeKernel(s.k_copy, null, &copy_gws, &copy_lws, none)).release();
+    try s.k_copy[ci].setArg(c_int, 5, field);
+    const copy_gws: [2]usize = .{ vsh.ceilN(@as(usize, cfg.w), 16), vsh.ceilN(@as(usize, cfg.dst_h), 8) };
+    const copy_lws: [2]usize = .{ 16, 8 };
+    try ndr(s, s.k_copy[ci], &copy_gws, &copy_lws);
 
-    // interp rows (half-pel uses a distinct kernel; all args set in init)
-    const ik = if (d.hp) s.k_interp_hp else s.k_interp;
-    const interp_gws: [2]usize = .{ d.lws, d.n_interp };
+    const ik = if (d.hp) s.k_interp_hp[ci] else s.k_interp[ci];
+    const interp_gws: [2]usize = .{ d.lws, n_interp };
     const interp_lws: [2]usize = .{ d.lws, 1 };
-    (try s.queue.enqueueNDRangeKernel(ik, null, &interp_gws, &interp_lws, none)).release();
+    try ndr(s, ik, &interp_gws, &interp_lws);
 
-    // pick the buffer holding the finished (vertical-orientation) result
     var result = s.d_dst;
     if (d.vcheck > 0) {
-        // sclip (if any) is uploaded per frame; its buffer arg + use_scp are static.
         if (scpp) |sp| {
-            // sclip is at output resolution; transpose it into column-major for EEDI3H.
             if (d.horizontal) {
-                (try s.queue.enqueueWriteBuffer(f32, s.d_scpframe, false, 0, sp, none)).release();
-                try runTranspose(s, s.d_scp, s.d_scpframe, d.out_w, d.in_h, d.out_stride, d.stride);
+                try writeBuf(u8, s, s.d_scpframe, sp);
+                try runTranspose(s, s.d_scp, s.d_scpframe, cfg.out_w, cfg.in_h, cfg.out_stride, cfg.stride);
             } else {
-                (try s.queue.enqueueWriteBuffer(f32, s.d_scp, false, 0, sp, none)).release();
+                try writeBuf(u8, s, s.d_scp, sp);
             }
         }
 
-        // Seed the output buffer with the interp snapshot so kept rows and
-        // non-vcheckable interp rows pass through, and so each row's d2p (the
-        // previous interp row) reads a valid value before it is overwritten.
-        if (cl.c.clEnqueueCopyBuffer(s.queue.handle, s.d_dst.handle, s.d_dst2.handle, 0, 0, d.stride * d.dst_h * @sizeOf(f32), 0, null, null) != cl.c.CL_SUCCESS) {
+        if (cl.c.clEnqueueCopyBuffer(s.queue.handle, s.d_dst.handle, s.d_dst2.handle, 0, 0, @as(usize, cfg.stride) * cfg.dst_h * d.bytes, 0, null, null) != cl.c.CL_SUCCESS) {
             return error.EnqueueCopyBuffer;
         }
 
-        // `field` is the only per-frame vcheck arg; the rest are set in init.
-        try s.k_vcheck.setArg(c_int, 9, field);
+        try s.k_vcheck[ci].setArg(c_int, 9, field);
+        try s.k_vcheck[ci].setArg(c_int, 10, @intCast(n_interp));
 
-        // Single launch: one workgroup walks the interpolated rows in order,
-        // barrier()-ing between them so each row's d2p (the previous interp row,
-        // read at x±dir) sees the finished, already-vchecked prior row. Bit-exact
-        // with the CPU's in-place feedback, with no per-row launch overhead. A
-        // large workgroup keeps enough warps resident to hide the serial inter-row
-        // dependency latency on the single SM this (necessarily) runs on.
         const vc_wg: usize = @min(@as(usize, 1024), d.max_wg);
         const vc_gws: [1]usize = .{vc_wg};
         const vc_lws: [1]usize = .{vc_wg};
-        (try s.queue.enqueueNDRangeKernel(s.k_vcheck, null, &vc_gws, &vc_lws, none)).release();
+        try ndr(s, s.k_vcheck[ci], &vc_gws, &vc_lws);
         result = s.d_dst2;
     }
 
-    // download (transpose back to row-major for EEDI3H)
     if (d.horizontal) {
-        try runTranspose(s, s.d_outframe, result, d.w, d.dst_h, d.stride, d.out_stride);
-        const rd = try s.queue.enqueueReadBuffer(f32, s.d_outframe, false, 0, dstp, none);
-        try cl.waitForEvents(&.{rd});
-        rd.release();
+        try runTranspose(s, s.d_outframe, result, cfg.w, cfg.dst_h, cfg.stride, cfg.out_stride);
+        try readBuf(u8, s, s.d_outframe, dstp);
     } else {
-        const rd = try s.queue.enqueueReadBuffer(f32, result, false, 0, dstp, none);
-        try cl.waitForEvents(&.{rd});
-        rd.release();
+        try readBuf(u8, s, result, dstp);
+    }
+    if (sync) {
+        if (cl.c.clFinish(s.queue.handle) != cl.c.CL_SUCCESS) return error.Finish;
     }
 }
 
-fn runTranspose(s: *Stream, dst: cl.Buffer(f32), src: cl.Buffer(f32), in_w: u32, in_h: u32, in_stride: u32, out_stride: u32) !void {
+fn runTranspose(s: *Stream, dst: cl.Buffer(u8), src: cl.Buffer(u8), in_w: u32, in_h: u32, in_stride: u32, out_stride: u32) !void {
     try s.k_transpose.setArg(@TypeOf(dst), 0, dst);
     try s.k_transpose.setArg(@TypeOf(src), 1, src);
     try s.k_transpose.setArg(c_int, 2, @intCast(in_w));
@@ -746,7 +1000,7 @@ fn runTranspose(s: *Stream, dst: cl.Buffer(f32), src: cl.Buffer(f32), in_w: u32,
     try s.k_transpose.setArg(c_int, 5, @intCast(out_stride));
     const gws: [2]usize = .{ vsh.ceilN(@as(usize, in_w), 16), vsh.ceilN(@as(usize, in_h), 16) };
     const lws: [2]usize = .{ 16, 16 };
-    (try s.queue.enqueueNDRangeKernel(s.k_transpose, null, &gws, &lws, &.{})).release();
+    try ndr(s, s.k_transpose, &gws, &lws);
 }
 
 fn getFrame(n: c_int, ar: vs.ActivationReason, instance_data: ?*anyopaque, _: ?*?*anyopaque, frame_ctx: ?*vs.FrameContext, core_ptr: ?*vs.Core, vsapi: ?*const vs.API) callconv(.c) ?*const vs.Frame {
@@ -778,10 +1032,13 @@ fn getFrame(n: c_int, ar: vs.ActivationReason, instance_data: ?*anyopaque, _: ?*
 
         var plane: u32 = 0;
         while (plane < d.vi.format.numPlanes) : (plane += 1) {
-            const srcp = src.getReadSlice2(f32, plane);
-            const dstp = dst.getWriteSlice2(f32, plane);
-            const scpp: ?[]const f32 = if (scp) |sc| sc.getReadSlice2(f32, plane) else null;
-            process(d, s, dstp, srcp, scpp, field) catch |err| {
+            const ci = d.plane_cfg[plane];
+            const srcp = src.getReadSlice(plane);
+            const dstp = dst.getWriteSlice(plane);
+            const scpp: ?[]const u8 = if (scp) |sc| sc.getReadSlice(plane) else null;
+            std.debug.assert(src.getStride2(u8, plane) ==
+                (if (d.horizontal) d.configs[ci].in_stride else d.configs[ci].stride) * d.bytes);
+            process(d, s, ci, dstp, srcp, scpp, field, plane == d.vi.format.numPlanes - 1) catch |err| {
                 zapi.setFilterError("EEDI3: process failed.");
                 std.log.err("EEDI3 process failed: {}", .{err});
                 dst.deinit();
@@ -807,9 +1064,20 @@ fn getFrame(n: c_int, ar: vs.ActivationReason, instance_data: ?*anyopaque, _: ?*
 fn free(instance_data: ?*anyopaque, _: ?*vs.Core, vsapi: ?*const vs.API) callconv(.c) void {
     const d: *Data = @ptrCast(@alignCast(instance_data));
     d.pool.deinit();
+    d.context.release();
+    freeStencilTables(d);
     vsapi.?.freeNode.?(d.node);
     vsapi.?.freeNode.?(d.sclip);
     allocator.destroy(d);
+}
+
+fn freeStencilTables(d: *Data) void {
+    for (0..d.n_cfg) |ci| {
+        for (0..2) |f| {
+            allocator.free(d.rowidx_host[ci][f]);
+            allocator.free(d.dsty_host[ci][f]);
+        }
+    }
 }
 
 pub fn createEEDI3(in: ?*const vs.Map, out: ?*vs.Map, ud: ?*anyopaque, core_ptr: ?*vs.Core, vsapi: ?*const vs.API) callconv(.c) void {
@@ -838,10 +1106,20 @@ fn createImpl(in: ?*const vs.Map, out: ?*vs.Map, _: ?*anyopaque, core_ptr: ?*vs.
         zapi.freeNode(d.sclip);
     };
 
-    if (d.vi.format.sampleType != .Float or d.vi.format.bitsPerSample != 32) {
-        map_out.setError("EEDI3: only 32-bit float (GrayS) is supported.");
+    const cf = d.vi.format.colorFamily;
+    const fmt = d.vi.format;
+    const io_bits: i32 = fmt.bitsPerSample;
+    const depth_ok = (fmt.sampleType == .Integer and (io_bits == 8 or io_bits == 16)) or
+        (fmt.sampleType == .Float and (io_bits == 16 or io_bits == 32));
+    if (!depth_ok or d.vi.width <= 0 or d.vi.height <= 0 or
+        (cf != .Gray and cf != .YUV and cf != .RGB))
+    {
+        map_out.setError("EEDI3: input bitdepth must be 8/16 (integer), 16 (half) or 32 (float), Gray/YUV/RGB.");
         return;
     }
+    d.bits = io_bits;
+    d.half = fmt.sampleType == .Float and io_bits == 16;
+    d.bytes = @intCast(fmt.bytesPerSample);
 
     const field = map_in.getValue(i32, "field") orelse 0;
     const mdis = map_in.getValue(i32, "mdis") orelse 20;
@@ -851,8 +1129,7 @@ fn createImpl(in: ?*const vs.Map, out: ?*vs.Map, _: ?*anyopaque, core_ptr: ?*vs.
     d.gamma = map_in.getValue(f32, "gamma") orelse 20.0;
     d.dh = map_in.getBool("dh") orelse false;
     d.hp = map_in.getBool("hp") orelse false;
-
-    // the interpolated axis (height for EEDI3, width for EEDI3H)
+    const ns_req = map_in.getValue(i32, "num_streams");
     const interp_axis: i32 = if (horizontal) d.vi.width else d.vi.height;
 
     if (field < 0 or field > 3) return map_out.setError("EEDI3: field must be 0..3.");
@@ -865,6 +1142,11 @@ fn createImpl(in: ?*const vs.Map, out: ?*vs.Map, _: ?*anyopaque, core_ptr: ?*vs.
     if (nrad < 0 or nrad > 3) return map_out.setError("EEDI3: nrad 0..3.");
     if (mdis < 1 or mdis > 40) return map_out.setError("EEDI3: mdis 1..40.");
     if (vcheck < 0 or vcheck > 3) return map_out.setError("EEDI3: vcheck 0..3.");
+    if (ns_req) |ns| {
+        if (ns < 1 or ns > 32) return map_out.setError("EEDI3: num_streams must be 1..32.");
+    }
+    const device_id = map_in.getValue(i32, "device_id") orelse 0;
+    if (device_id < 0) return map_out.setError("EEDI3: invalid device ID.");
 
     if (field > 1) {
         if (d.vi.numFrames > std.math.maxInt(i32) / 2) return map_out.setError("EEDI3: clip too long.");
@@ -899,36 +1181,81 @@ fn createImpl(in: ?*const vs.Map, out: ?*vs.Map, _: ?*anyopaque, core_ptr: ?*vs.
     d.rcp1 = 1.0 / vthresh1;
     d.rcp2 = 1.0 / d.vthresh2;
 
-    // Internal pipeline is always vertical. For EEDI3H the buffers are the
-    // transposed frame: w = input height, src_h = input width, dst_h = output width.
-    if (horizontal) {
-        d.in_w = @intCast(vi_in.width);
-        d.in_h = @intCast(vi_in.height);
-        d.out_w = @intCast(d.vi.width);
-        d.w = @intCast(vi_in.height);
-        d.src_h = @intCast(vi_in.width);
-        d.dst_h = @intCast(d.vi.width);
-        d.in_stride = @intCast(vsh.ceilN(@as(usize, d.in_w), 8));
-        d.out_stride = @intCast(vsh.ceilN(@as(usize, d.out_w), 8));
-    } else {
-        d.w = @intCast(vi_in.width);
-        d.src_h = @intCast(vi_in.height);
-        d.dst_h = @intCast(d.vi.height);
+    d.tpitch = @intCast(if (d.hp) 4 * mdis + 1 else 2 * mdis + 1);
+    d.lws = @max(vsh.ceilN(@as(usize, d.tpitch), 32), 128);
+    d.pad = @intCast(3 * mdis + nrad + 2);
+
+    {
+        const strides_out = vszipcl.strideFromVi(&d.vi);
+        const strides_in = vszipcl.strideFromVi(vi_in);
+        const nplanes: usize = @intCast(d.vi.format.numPlanes);
+        var p: usize = 0;
+        while (p < nplanes) : (p += 1) {
+            const cat: usize = if (p == 0) 0 else 1;
+            const sw: u5 = if (p == 0) 0 else @intCast(d.vi.format.subSamplingW);
+            const sh: u5 = if (p == 0) 0 else @intCast(d.vi.format.subSamplingH);
+            var cfg: Config = .{ .w = 0, .src_h = 0, .dst_h = 0, .stride = 0, .pstride = 0, .n_interp_max = 0 };
+            if (horizontal) {
+                cfg.in_w = @as(u32, @intCast(vi_in.width)) >> sw;
+                cfg.in_h = @as(u32, @intCast(vi_in.height)) >> sh;
+                cfg.out_w = @as(u32, @intCast(d.vi.width)) >> sw;
+                cfg.w = cfg.in_h;
+                cfg.src_h = cfg.in_w;
+                cfg.dst_h = cfg.out_w;
+                cfg.in_stride = strides_in[cat];
+                cfg.out_stride = strides_out[cat];
+                cfg.stride = strides_out[cat];
+            } else {
+                cfg.w = @as(u32, @intCast(vi_in.width)) >> sw;
+                cfg.src_h = @as(u32, @intCast(vi_in.height)) >> sh;
+                cfg.dst_h = @as(u32, @intCast(d.vi.height)) >> sh;
+                cfg.stride = strides_out[cat];
+            }
+            cfg.pstride = @intCast(vsh.ceilN(@as(usize, d.pad) * 2 + cfg.w, 8));
+            cfg.n_interp_max = (cfg.dst_h + 1) / 2;
+            var ci: usize = 0;
+            while (ci < d.n_cfg) : (ci += 1) {
+                if (std.meta.eql(cfg, d.configs[ci])) break;
+            }
+            if (ci == d.n_cfg) {
+                d.configs[ci] = cfg;
+                d.n_cfg += 1;
+            }
+            d.plane_cfg[p] = ci;
+        }
     }
 
-    d.stride = vszipcl.strideFromVi(&d.vi)[0];
-    d.n_interp = if (d.dh) d.src_h else d.src_h / 2;
-    d.tpitch = @intCast(if (d.hp) 4 * mdis + 1 else 2 * mdis + 1);
-    d.lws = vsh.ceilN(@as(usize, d.tpitch), 32);
-    // Horizontal mirror-pad margin: covers the max reach of the cost/interp
-    // loops (interp tail x±3*mdis, conn cost x±(2*mdis+nrad), hp ±(mdis+nrad+2)).
-    // pad = 3*mdis + nrad + 2 is a safe upper bound for all of them.
-    d.pad = @intCast(3 * mdis + nrad + 2);
-    d.pstride = @intCast(vsh.ceilN(@as(usize, d.pad) * 2 + d.w, 8));
+    if (@as(usize, d.configs[0].stride) * d.configs[0].dst_h >= (1 << 31)) {
+        map_out.setError("EEDI3: frame too large (a plane exceeds 2^31 samples).");
+        return;
+    }
 
-    initOpenCL(&d) catch |err| {
-        map_out.setError("EEDI3: OpenCL init failed.");
+    for (0..d.n_cfg) |ci| {
+        const cfg = &d.configs[ci];
+        const sh_i: i32 = @intCast(cfg.src_h);
+        for (0..2) |f| {
+            const n: u32 = (cfg.dst_h - @as(u32, @intCast(f)) + 1) / 2;
+            const ri = allocator.alloc(i32, @as(usize, n) * 4) catch unreachable;
+            const dy = allocator.alloc(i32, n) catch unreachable;
+            var off: u32 = 0;
+            var iy: i32 = @intCast(f);
+            while (off < n) : (off += 1) {
+                ri[off * 4 + 0] = stencilRow(iy - 3, sh_i, d.dh);
+                ri[off * 4 + 1] = stencilRow(iy - 1, sh_i, d.dh);
+                ri[off * 4 + 2] = stencilRow(iy + 1, sh_i, d.dh);
+                ri[off * 4 + 3] = stencilRow(iy + 3, sh_i, d.dh);
+                dy[off] = iy;
+                iy += 2;
+            }
+            d.rowidx_host[ci][f] = ri;
+            d.dsty_host[ci][f] = dy;
+        }
+    }
+
+    initOpenCL(&d, @intCast(device_id)) catch |err| {
+        map_out.setError(if (err == error.InvalidDeviceID) "EEDI3: invalid device ID." else "EEDI3: OpenCL init failed.");
         std.log.err("EEDI3 OpenCL init failed: {}", .{err});
+        freeStencilTables(&d);
         return;
     };
 
@@ -936,26 +1263,26 @@ fn createImpl(in: ?*const vs.Map, out: ?*vs.Map, _: ?*anyopaque, core_ptr: ?*vs.
     data.* = d;
     keep = true;
 
-    var info: vs.CoreInfo = .{};
-    zapi.getCoreInfo(core_ptr, &info);
-    const threads: usize = if (info.numThreads > 0) @intCast(info.numThreads) else 1;
-    const streams: usize = @min(@as(usize, 4), threads);
+    const streams: usize = if (ns_req) |ns| @intCast(ns) else 1;
     data.pool.prime(data, streams);
     data.pool.prewarm(streams) catch |err| {
         map_out.setError("EEDI3: OpenCL stream init failed.");
         std.log.err("EEDI3 stream init failed: {}", .{err});
         data.pool.deinit();
+        data.context.release();
+        freeStencilTables(data);
         allocator.destroy(data);
         keep = false;
         return;
     };
 
     var dep_buf: [2]vs.FilterDependency = undefined;
-    dep_buf[0] = .{ .source = d.node, .requestPattern = .StrictSpatial };
+    dep_buf[0] = .{ .source = d.node, .requestPattern = if (d.field > 1) .General else .StrictSpatial };
     var ndeps: usize = 1;
     if (d.sclip) |sc| {
         dep_buf[ndeps] = .{ .source = sc, .requestPattern = .StrictSpatial };
         ndeps += 1;
     }
-    zapi.createVideoFilter(out, if (horizontal) "EEDI3H" else "EEDI3", &d.vi, getFrame, free, .Unordered, dep_buf[0..ndeps], data);
+
+    zapi.createVideoFilter(out, if (horizontal) "EEDI3H" else "EEDI3", &d.vi, getFrame, free, .Parallel, dep_buf[0..ndeps], data);
 }

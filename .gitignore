@@ -10,3 +10,4 @@ build-help/zig-*
 *.so
 build/
 zig-pkg/
+__pycache__/

@@ -10,226 +10,359 @@ const vsh = vapoursynth.vshelper;
 const ZAPI = vapoursynth.ZAPI;
 
 const allocator = std.heap.c_allocator;
+const FLT_EPSILON: f32 = 1.19209290e-7;
+const Mode = enum { small, large };
+const large_path_radius_threshold: i32 = 32;
+const large_blk_x: usize = 16;
+const large_blk_y: usize = 8;
+const large_r: usize = 8;
+
+const Config = struct {
+    key: Key,
+    ksize: i32,
+    radius: i32,
+    mode: Mode,
+    weights: []const f32,
+    const Key = struct { w: i32, h: i32, stride: i32, sigma: f32 };
+
+    fn extent(self: *const Config) usize {
+        return @as(usize, @intCast(self.key.stride)) * @as(usize, @intCast(self.key.h));
+    }
+};
 
 const Data = struct {
     node: ?*vs.Node,
     vi: *const vs.VideoInfo,
-
     platform: cl.Platform,
     device: cl.Device,
-    buff_size: usize,
-
-    blur_weights: []const f32, // read-only host weights; each stream builds its own device buffer
-    ksize: i32,
-
+    context: cl.Context,
+    bits: i32,
+    half: bool,
+    bytes: u32,
+    process: [3]bool,
+    plane_cfg: [3]usize,
+    configs: [3]Config,
+    n_cfg: usize,
+    any_large: bool,
+    buff_elems: usize,
     pool: clpool.Pool(Stream, Data),
 };
 
-/// Per-concurrent-frame OpenCL resources.
+const CfgRes = struct {
+    program: ?cl.Program,
+    weights: cl.Buffer(f32),
+    k1: cl.Kernel,
+    k2: ?cl.Kernel,
+};
+
 const Stream = struct {
-    context: cl.Context,
-    program: cl.Program,
     queue: cl.CommandQueue,
-    src: cl.Buffer(f32),
-    dst: cl.Buffer(f32),
-    tmp: cl.Buffer(f32),
-    blur_kernel: cl.Buffer(f32),
-    vertical_blur: cl.Kernel,
-    horizontal_blur: cl.Kernel,
+    src: cl.Buffer(u8),
+    dst: cl.Buffer(u8),
+    tmp: ?cl.Buffer(f32),
+    large_prog: ?cl.Program,
+    cfgs: [3]CfgRes,
+    n_cfg_ready: usize,
 
     pub fn init(self: *Stream, d: *Data) !void {
-        self.context = try cl.createContext(&.{d.device}, .{ .platform = d.platform });
-        errdefer self.context.release();
-        self.program = try cl.createProgramWithSource(self.context, vertical_blur ++ horizontal_blur);
-        errdefer self.program.release();
-        self.program.build(&.{d.device}, "-cl-std=CL3.0") catch |err| {
-            if (err == error.BuildProgramFailure) {
-                const log = try self.program.getBuildLog(allocator, d.device);
-                defer allocator.free(log);
-                std.log.err("OpenCL kernel build failed: {s}", .{log});
-            }
-            return err;
-        };
-        self.queue = try cl.createCommandQueue(self.context, d.device, .{});
+        self.n_cfg_ready = 0;
+        self.tmp = null;
+        self.large_prog = null;
+
+        self.queue = try cl.createCommandQueue(d.context, d.device, .{});
         errdefer self.queue.release();
-        self.src = try cl.createBuffer(f32, self.context, .{ .read_only = true }, d.buff_size);
+        self.src = try cl.createBuffer(u8, d.context, .{ .read_only = true }, d.buff_elems * d.bytes);
         errdefer self.src.release();
-        self.dst = try cl.createBuffer(f32, self.context, .{ .read_write = true }, d.buff_size);
+        self.dst = try cl.createBuffer(u8, d.context, .{ .read_write = true }, d.buff_elems * d.bytes);
         errdefer self.dst.release();
-        self.tmp = try cl.createBuffer(f32, self.context, .{ .read_write = true }, d.buff_size);
-        errdefer self.tmp.release();
-        self.blur_kernel = try cl.createBufferWithData(f32, self.context, .{ .read_only = true }, d.blur_weights);
-        errdefer self.blur_kernel.release();
-        self.vertical_blur = try cl.createKernel(self.program, "vertical_blur");
-        errdefer self.vertical_blur.release();
-        self.horizontal_blur = try cl.createKernel(self.program, "horizontal_blur");
+        if (d.any_large)
+            self.tmp = try cl.createBuffer(f32, d.context, .{ .read_write = true }, d.buff_elems);
+        errdefer if (self.tmp) |t| t.release();
+
+        const idx_t: []const u8 = if (d.buff_elems < (1 << 31)) "int" else "long";
+        if (d.any_large) {
+            const opts = try std.fmt.allocPrintSentinel(allocator,
+                \\-cl-std=CL3.0 -DBX={d} -DBY={d} -DR={d} -DIDX={s} -DBITS={d} -DHALF={d}
+            , .{ large_blk_x, large_blk_y, large_r, idx_t, d.bits, @intFromBool(d.half) }, 0);
+            defer allocator.free(opts);
+            self.large_prog = try buildProgram(d, io_src ++ vertical_blur_src ++ horizontal_blur_src, opts);
+        }
+        errdefer if (self.large_prog) |pr| pr.release();
+
+        errdefer self.releaseCfgs();
+        var ci: usize = 0;
+        while (ci < d.n_cfg) : (ci += 1) {
+            const cfg = &d.configs[ci];
+            const cr = &self.cfgs[ci];
+            cr.program = null;
+            cr.k2 = null;
+            cr.weights = try cl.createBufferWithData(f32, d.context, .{ .read_only = true }, cfg.weights);
+            errdefer cr.weights.release();
+            switch (cfg.mode) {
+                .small => {
+                    const opts = try std.fmt.allocPrintSentinel(allocator,
+                        \\-cl-std=CL3.0 -DW={d} -DH={d} -DSTRIDE={d} -DKLEN={d} -DRAD={d} -DBLK_X=16 -DBLK_Y=8 -DVRT=3 -DIDX={s} -DBITS={d} -DHALF={d}
+                    , .{ cfg.key.w, cfg.key.h, cfg.key.stride, cfg.ksize, cfg.radius, idx_t, d.bits, @intFromBool(d.half) }, 0);
+                    defer allocator.free(opts);
+                    const prog = try buildProgram(d, io_src ++ gauss_blur_src, opts);
+                    cr.program = prog;
+                    errdefer prog.release();
+                    cr.k1 = try cl.createKernel(prog, "gauss_blur");
+                    errdefer cr.k1.release();
+                    try cr.k1.setArg(@TypeOf(self.dst), 0, self.dst);
+                    try cr.k1.setArg(@TypeOf(self.src), 1, self.src);
+                    try cr.k1.setArg(@TypeOf(cr.weights), 2, cr.weights);
+                },
+                .large => {
+                    const prog = self.large_prog.?;
+                    const tmp = self.tmp.?;
+                    cr.k1 = try cl.createKernel(prog, "vertical_blur");
+                    errdefer cr.k1.release();
+                    const k2 = try cl.createKernel(prog, "horizontal_blur");
+                    cr.k2 = k2;
+                    errdefer k2.release();
+                    try cr.k1.setArg(@TypeOf(tmp), 0, tmp);
+                    try cr.k1.setArg(@TypeOf(self.src), 1, self.src);
+                    try cr.k1.setArg(@TypeOf(cr.weights), 2, cr.weights);
+                    try cr.k1.setArg(c_int, 3, cfg.ksize);
+                    try cr.k1.setArg(c_int, 4, cfg.key.w);
+                    try cr.k1.setArg(c_int, 5, cfg.key.h);
+                    try cr.k1.setArg(c_int, 6, cfg.key.stride);
+                    try k2.setArg(@TypeOf(self.dst), 0, self.dst);
+                    try k2.setArg(@TypeOf(tmp), 1, tmp);
+                    try k2.setArg(@TypeOf(cr.weights), 2, cr.weights);
+                    try k2.setArg(c_int, 3, cfg.ksize);
+                    try k2.setArg(c_int, 4, cfg.key.w);
+                    try k2.setArg(c_int, 5, cfg.key.h);
+                    try k2.setArg(c_int, 6, cfg.key.stride);
+                },
+            }
+            self.n_cfg_ready = ci + 1;
+        }
+    }
+
+    fn releaseCfgs(self: *Stream) void {
+        var i: usize = self.n_cfg_ready;
+        while (i > 0) {
+            i -= 1;
+            const cr = &self.cfgs[i];
+            if (cr.k2) |k| k.release();
+            cr.k1.release();
+            cr.weights.release();
+            if (cr.program) |pr| pr.release();
+        }
     }
 
     pub fn deinit(self: *Stream) void {
-        self.horizontal_blur.release();
-        self.vertical_blur.release();
-        self.blur_kernel.release();
-        self.tmp.release();
+        self.releaseCfgs();
+        if (self.large_prog) |pr| pr.release();
+        if (self.tmp) |t| t.release();
         self.dst.release();
         self.src.release();
         self.queue.release();
-        self.program.release();
-        self.context.release();
     }
 };
 
-const vertical_blur =
-    \\kernel void vertical_blur(global float *dst, global const float *src,
-    \\                          global const float *blur_kernel, int kernel_len,
-    \\                          const int w, const int h, const int stride) {
-    \\
-    \\    const int x = get_global_id(0);
-    \\    const int y = get_global_id(1);
-    \\    if (x >= w || y >= h) {
-    \\        return;
-    \\    }
-    \\
-    \\    const int radius = kernel_len / 2;
-    \\    float sum = 0.0f;
-    \\
-    \\    // First loop: Handles the top edge of the image where src_y < 0.
-    \\    for (int k = 0; k < radius - y && k < kernel_len; k++) {
-    \\        int src_y = y + k - radius;
-    \\        src_y = -src_y;
-    \\        sum += src[src_y * stride + x] * blur_kernel[k];
-    \\    }
-    \\
-    \\    // Second loop: Handles the main body of the image where src_y is in-bounds.
-    \\    for (int k = max(0, radius - y); k < min(kernel_len, h + radius - y); k++) {
-    \\        const int src_y = y + k - radius;
-    \\        sum += src[src_y * stride + x] * blur_kernel[k];
-    \\    }
-    \\
-    \\    // Third loop: Handles the bottom edge of the image where src_y >= h.
-    \\    for (int k = max(0, h + radius - y); k < kernel_len; k++) {
-    \\        int src_y = y + k - radius;
-    \\        src_y = 2 * (h - 1) - src_y;
-    \\        sum += src[src_y * stride + x] * blur_kernel[k];
-    \\    }
-    \\
-    \\    dst[y * stride + x] = sum;
-    \\}
-    \\
-;
-
-const horizontal_blur =
-    \\kernel void horizontal_blur(global float *dst, global const float *src,
-    \\                            global const float *blur_kernel, int kernel_len,
-    \\                            const int w, const int h, const int stride) {
-    \\
-    \\    const int x = get_global_id(0);
-    \\    const int y = get_global_id(1);
-    \\    if (x >= w || y >= h) {
-    \\        return;
-    \\    }
-    \\
-    \\    const int radius = kernel_len / 2;
-    \\    float sum = 0.0f;
-    \\
-    \\    // First loop: Handles the left edge of the image where src_x < 0.
-    \\    for (int k = 0; k < radius - x && k < kernel_len; k++) {
-    \\        int src_x = x + k - radius;
-    \\        src_x = -src_x;
-    \\        sum += src[y * stride + src_x] * blur_kernel[k];
-    \\    }
-    \\
-    \\    // Second loop: Handles the main body of the image where src_x is in-bounds.
-    \\    for (int k = max(0, radius - x); k < min(kernel_len, w + radius - x); k++) {
-    \\        const int src_x = x + k - radius;
-    \\        sum += src[y * stride + src_x] * blur_kernel[k];
-    \\    }
-    \\
-    \\    // Third loop: Handles the right edge of the image where src_x >= w.
-    \\    for (int k = max(0, w + radius - x); k < kernel_len; k++) {
-    \\        int src_x = x + k - radius;
-    \\        src_x = 2 * (w - 1) - src_x;
-    \\        sum += src[y * stride + src_x] * blur_kernel[k];
-    \\    }
-    \\
-    \\    dst[y * stride + x] = sum;
-    \\}
-    \\
-;
-
-fn initOpenCL(d: *Data) !void {
-    const platforms = try cl.getPlatforms(allocator);
-    defer allocator.free(platforms);
-
-    if (platforms.len == 0) {
-        return error.NoPlatforms;
-    }
-
-    const platform = platforms[0];
-    const devices = try platform.getDevices(allocator, cl.DeviceType.all);
-    defer allocator.free(devices);
-
-    if (devices.len == 0) {
-        return error.NoDevices;
-    }
-
-    d.device = devices[0];
-
-    d.platform = platform;
+fn buildProgram(d: *Data, src_txt: [:0]const u8, opts: [:0]const u8) !cl.Program {
+    var prog = try cl.createProgramWithSource(d.context, src_txt);
+    errdefer prog.release();
+    prog.build(&.{d.device}, opts) catch |err| {
+        if (err == error.BuildProgramFailure) {
+            const log = try prog.getBuildLog(allocator, d.device);
+            defer allocator.free(log);
+            std.log.err("GaussBlur OpenCL build failed: {s}", .{log});
+        }
+        return err;
+    };
+    return prog;
 }
 
-fn process(d: *Data, s: *Stream, dstp: []f32, srcp: []const f32, w: i32, h: i32, stride: i32) !void {
-    const local_work_size: [2]usize = .{ 16, 16 };
-    const global_work_size: [2]usize = .{
-        vsh.ceilN(@intCast(w), local_work_size[0]),
-        vsh.ceilN(@intCast(h), local_work_size[1]),
-    };
+const io_src =
+    \\#if BITS == 32
+    \\typedef float io_t;
+    \\#define LOADI(p, i) ((p)[i])
+    \\#define STOREI(p, i, x) ((p)[i] = (x))
+    \\#elif BITS == 16 && HALF
+    \\typedef half io_t;
+    \\#define LOADI(p, i) vload_half((size_t)(i), p)
+    \\#define STOREI(p, i, x) vstore_half_rte((x), (size_t)(i), p)
+    \\#elif BITS == 16
+    \\typedef ushort io_t;
+    \\#define LOADI(p, i) convert_float((p)[i])
+    \\#define STOREI(p, i, x) ((p)[i] = convert_ushort_sat_rte(x))
+    \\#else
+    \\typedef uchar io_t;
+    \\#define LOADI(p, i) convert_float((p)[i])
+    \\#define STOREI(p, i, x) ((p)[i] = convert_uchar_sat_rte(x))
+    \\#endif
+    \\
+;
 
-    const write_complete = try s.queue.enqueueWriteBuffer(f32, s.src, false, 0, srcp, &.{});
-    defer write_complete.release();
+const gauss_blur_src =
+    \\kernel __attribute__((reqd_work_group_size(BLK_X, BLK_Y, 1)))
+    \\void gauss_blur(global io_t *restrict dst, global const io_t *restrict src,
+    \\                global const float *restrict blur) {
+    \\    local float vblur[VRT*BLK_Y][BLK_X + 2*RAD];
+    \\    const int lx = get_local_id(0), ly = get_local_id(1);
+    \\    const int gx0 = get_group_id(0) * BLK_X;            // first output column
+    \\    const int gy0 = get_group_id(1) * (VRT*BLK_Y);      // first output row
+    \\
+    \\    // Phase 1 — vertical blur of the tile columns + a +-RAD X-halo, into local memory.
+    \\    for (int ry = ly; ry < VRT*BLK_Y; ry += BLK_Y) {
+    \\        const int y = gy0 + ry;
+    \\        if (y >= H) continue;                            // row past frame: Phase 2 never reads it
+    \\        for (int cj = lx; cj < BLK_X + 2*RAD; cj += BLK_X) {
+    \\            int cx = gx0 - RAD + cj;                      // raw (maybe OOB) column
+    \\            if (cx < 0) cx = -cx;                         // left mirror  (== scalar -src_x)
+    \\            else if (cx >= W) cx = 2*(W-1) - cx;          // right mirror (== 2*(w-1)-src_x)
+    \\            cx = min(max(cx, 0), W-1);                    // guard the unused over-staged tail
+    \\                                                         // (tiny/odd W); a no-op for read cells
+    \\            float vsum = 0.0f;
+    \\            for (int k = 0; k < KLEN; ++k) {              // ascending k
+    \\                int sy = y + k - RAD;
+    \\                if (sy < 0) sy = -sy;                     // top mirror    (== scalar -src_y)
+    \\                else if (sy >= H) sy = 2*(H-1) - sy;      // bottom mirror (== 2*(h-1)-src_y)
+    \\                vsum += LOADI(src, (IDX)sy*STRIDE + cx) * blur[k];
+    \\            }
+    \\            vblur[ry][cj] = vsum;
+    \\        }
+    \\    }
+    \\    barrier(CLK_LOCAL_MEM_FENCE);                        // every thread reaches it (returns are after)
+    \\
+    \\    // Phase 2 — horizontal blur from vblur -> dst. Output col x, VRT output rows/thread.
+    \\    const int x = gx0 + lx;
+    \\    if (x >= W) return;
+    \\    for (int r = 0; r < VRT; ++r) {
+    \\        const int y = gy0 + ly + r*BLK_Y;
+    \\        if (y >= H) return;                              // strided y increasing -> safe to bail
+    \\        const int lc = ly + r*BLK_Y;                     // local tile row for this output row
+    \\        float sum = 0.0f;
+    \\        for (int k = 0; k < KLEN; ++k)                   // ascending k
+    \\            sum += vblur[lc][lx + k] * blur[k];
+    \\        STOREI(dst, (IDX)y*STRIDE + x, sum);
+    \\    }
+    \\}
+;
 
-    // Vertical pass: src -> tmp
-    try s.vertical_blur.setArg(@TypeOf(s.tmp), 0, s.tmp);
-    try s.vertical_blur.setArg(@TypeOf(s.src), 1, s.src);
-    try s.vertical_blur.setArg(@TypeOf(s.blur_kernel), 2, s.blur_kernel);
-    try s.vertical_blur.setArg(c_int, 3, d.ksize);
-    try s.vertical_blur.setArg(c_int, 4, w);
-    try s.vertical_blur.setArg(c_int, 5, h);
-    try s.vertical_blur.setArg(c_int, 6, stride);
+const vertical_blur_src =
+    \\kernel __attribute__((reqd_work_group_size(BX, BY, 1)))
+    \\void vertical_blur(global float *restrict dst, global const io_t *restrict src,
+    \\                   global const float *restrict blur_kernel, int kernel_len,
+    \\                   const int w, const int h, const int stride) {
+    \\    const int x = get_global_id(0);
+    \\    const int y0 = get_global_id(1) * R;   // first of this thread's R output rows
+    \\    if (x >= w || y0 >= h) return;
+    \\    const int radius = kernel_len / 2;
+    \\    float sum[R], wreg[R];
+    \\    for (int j = 0; j < R; ++j) { sum[j] = 0.0f; wreg[j] = 0.0f; }
+    \\    for (int k = 0; k < kernel_len + (R - 1); ++k) {
+    \\        for (int j = R - 1; j >= 1; --j) wreg[j] = wreg[j - 1];   // slide the window
+    \\        wreg[0] = (k < kernel_len) ? blur_kernel[k] : 0.0f;
+    \\        int sy = y0 + k - radius;
+    \\        if (sy < 0) sy = -sy;                       // top mirror    (== scalar -src_y)
+    \\        else if (sy >= h) sy = 2 * (h - 1) - sy;    // bottom mirror (== 2*(h-1)-src_y)
+    \\        sy = min(max(sy, 0), h - 1);                // guards unused over-range taps only
+    \\        const float v = LOADI(src, (IDX)sy * stride + x);
+    \\        for (int j = 0; j < R; ++j) {
+    \\            if (k - j >= 0 && k - j < kernel_len)   // uniform: exactly kk = 0..kernel_len-1
+    \\                sum[j] += v * wreg[j];
+    \\        }
+    \\    }
+    \\    for (int j = 0; j < R; ++j) {
+    \\        if (y0 + j < h) dst[(IDX)(y0 + j) * stride + x] = sum[j];
+    \\    }
+    \\}
+;
 
-    const vertical_complete = try s.queue.enqueueNDRangeKernel(
-        s.vertical_blur,
-        null,
-        &global_work_size,
-        &local_work_size,
-        &.{write_complete},
-    );
-    defer vertical_complete.release();
+const horizontal_blur_src =
+    \\kernel __attribute__((reqd_work_group_size(BX, BY, 1)))
+    \\void horizontal_blur(global io_t *restrict dst, global const float *restrict src,
+    \\                     global const float *restrict blur_kernel, int kernel_len,
+    \\                     const int w, const int h, const int stride) {
+    \\    const int x0 = get_global_id(0) * R;   // first of this thread's R output columns
+    \\    const int y = get_global_id(1);
+    \\    if (x0 >= w || y >= h) return;
+    \\    const int radius = kernel_len / 2;
+    \\    const IDX row = (IDX)y * stride;
+    \\    float sum[R], wreg[R];
+    \\    for (int j = 0; j < R; ++j) { sum[j] = 0.0f; wreg[j] = 0.0f; }
+    \\    for (int k = 0; k < kernel_len + (R - 1); ++k) {
+    \\        for (int j = R - 1; j >= 1; --j) wreg[j] = wreg[j - 1];   // slide the window
+    \\        wreg[0] = (k < kernel_len) ? blur_kernel[k] : 0.0f;
+    \\        int sx = x0 + k - radius;
+    \\        if (sx < 0) sx = -sx;                       // left mirror  (== scalar -src_x)
+    \\        else if (sx >= w) sx = 2 * (w - 1) - sx;    // right mirror (== 2*(w-1)-src_x)
+    \\        sx = min(max(sx, 0), w - 1);                // guards unused over-range taps only
+    \\        const float v = src[row + sx];
+    \\        for (int j = 0; j < R; ++j) {
+    \\            if (k - j >= 0 && k - j < kernel_len)   // uniform: exactly kk = 0..kernel_len-1
+    \\                sum[j] += v * wreg[j];
+    \\        }
+    \\    }
+    \\    for (int j = 0; j < R; ++j) {
+    \\        if (x0 + j < w) STOREI(dst, row + x0 + j, sum[j]);
+    \\    }
+    \\}
+;
 
-    // Horizontal pass: tmp -> dst
-    try s.horizontal_blur.setArg(@TypeOf(s.dst), 0, s.dst);
-    try s.horizontal_blur.setArg(@TypeOf(s.tmp), 1, s.tmp);
-    try s.horizontal_blur.setArg(@TypeOf(s.blur_kernel), 2, s.blur_kernel);
-    try s.horizontal_blur.setArg(c_int, 3, d.ksize);
-    try s.horizontal_blur.setArg(c_int, 4, w);
-    try s.horizontal_blur.setArg(c_int, 5, h);
-    try s.horizontal_blur.setArg(c_int, 6, stride);
+const ndr = vszipcl.ndr;
+fn writeBuf(s: *Stream, buf: cl.Buffer(u8), src: []const u8) !void {
+    return vszipcl.enqWrite(s.queue, buf.handle, 0, src);
+}
+fn readBuf(s: *Stream, buf: cl.Buffer(u8), dst: []u8) !void {
+    return vszipcl.enqRead(s.queue, buf.handle, 0, dst);
+}
 
-    const horizontal_complete = try s.queue.enqueueNDRangeKernel(
-        s.horizontal_blur,
-        null,
-        &global_work_size,
-        &local_work_size,
-        &.{vertical_complete},
-    );
-    defer horizontal_complete.release();
+const ZFrame = @typeInfo(@TypeOf(ZAPI.initZFrame)).@"fn".return_type.?;
+const ZFrameW = @typeInfo(@TypeOf(ZFrame.newVideoFrame)).@"fn".return_type.?;
 
-    // The separable kernels leave this read off PoCL-CUDA's fast DMA path, but
-    // running several streams concurrently (see the pool size in create) lets
-    // these slower reads overlap across frames, which recovers throughput.
-    const read_complete = try s.queue.enqueueReadBuffer(f32, s.dst, false, 0, dstp, &.{horizontal_complete});
-    defer read_complete.release();
+fn process(d: *Data, s: *Stream, src: ZFrame, dst: ZFrameW) !void {
+    errdefer _ = cl.c.clFinish(s.queue.handle);
 
-    try cl.waitForEvents(&.{read_complete});
+    const num_planes: u32 = @intCast(d.vi.format.numPlanes);
+    var p: u32 = 0;
+    while (p < num_planes) : (p += 1) {
+        if (!d.process[p]) continue;
+
+        const cfg = &d.configs[d.plane_cfg[p]];
+        const cr = &s.cfgs[d.plane_cfg[p]];
+        const srcp = src.getReadSlice(p);
+        const dstp = dst.getWriteSlice(p);
+        std.debug.assert(srcp.len == cfg.extent() * d.bytes and dstp.len == srcp.len);
+        try writeBuf(s, s.src, srcp);
+
+        switch (cfg.mode) {
+            .small => {
+                const BX: usize = 16;
+                const BY: usize = 8;
+                const VR: usize = 3;
+                const lws: [2]usize = .{ BX, BY };
+                const gws: [2]usize = .{
+                    vsh.ceilN(@as(usize, @intCast(cfg.key.w)), BX),
+                    ((@as(usize, @intCast(cfg.key.h)) + VR * BY - 1) / (VR * BY)) * BY,
+                };
+                try ndr(s, cr.k1, &gws, &lws);
+            },
+            .large => {
+                const lws: [2]usize = .{ large_blk_x, large_blk_y };
+                const w_: usize = @intCast(cfg.key.w);
+                const h_: usize = @intCast(cfg.key.h);
+                const gws_v: [2]usize = .{
+                    ((w_ + large_blk_x - 1) / large_blk_x) * large_blk_x,
+                    (((h_ + large_r - 1) / large_r + large_blk_y - 1) / large_blk_y) * large_blk_y,
+                };
+                const gws_h: [2]usize = .{
+                    (((w_ + large_r - 1) / large_r + large_blk_x - 1) / large_blk_x) * large_blk_x,
+                    ((h_ + large_blk_y - 1) / large_blk_y) * large_blk_y,
+                };
+                try ndr(s, cr.k1, &gws_v, &lws);
+                try ndr(s, cr.k2.?, &gws_h, &lws);
+            },
+        }
+        try readBuf(s, s.dst, dstp);
+    }
+
+    if (cl.c.clFinish(s.queue.handle) != cl.c.CL_SUCCESS) return error.Finish;
 }
 
 fn getFrame(n: c_int, activation_reason: vs.ActivationReason, instance_data: ?*anyopaque, _: ?*?*anyopaque, frame_ctx: ?*vs.FrameContext, core: ?*vs.Core, vsapi: ?*const vs.API) callconv(.c) ?*const vs.Frame {
@@ -243,25 +376,21 @@ fn getFrame(n: c_int, activation_reason: vs.ActivationReason, instance_data: ?*a
         defer src.deinit();
         const dst = src.newVideoFrame();
 
+        const num_planes: u32 = @intCast(d.vi.format.numPlanes);
+        var p: u32 = 0;
+        while (p < num_planes) : (p += 1) {
+            if (!d.process[p]) @memcpy(dst.getWriteSlice(p), src.getReadSlice(p));
+        }
+
         const s = d.pool.acquire();
         defer d.pool.release(s);
 
-        var plane: u32 = 0;
-        while (plane < d.vi.format.numPlanes) : (plane += 1) {
-            const srcp = src.getReadSlice2(f32, plane);
-            const dstp = dst.getWriteSlice2(f32, plane);
-
-            const w = src.getWidthSigned(plane);
-            const h = src.getHeightSigned(plane);
-            const stride = src.getStride2(f32, plane);
-
-            process(d, s, dstp, srcp, w, h, @intCast(stride)) catch |err| {
-                zapi.setFilterError("GaussBlur: process frame failed.");
-                std.log.err("OpenCL process frame failed: {}", .{err});
-                dst.deinit();
-                return null;
-            };
-        }
+        process(d, s, src, dst) catch |err| {
+            zapi.setFilterError("GaussBlur: process frame failed.");
+            std.log.err("OpenCL process frame failed: {}", .{err});
+            dst.deinit();
+            return null;
+        };
 
         return dst.frame;
     }
@@ -271,9 +400,8 @@ fn getFrame(n: c_int, activation_reason: vs.ActivationReason, instance_data: ?*a
 
 fn free(instance_data: ?*anyopaque, _: ?*vs.Core, vsapi: ?*const vs.API) callconv(.c) void {
     const d: *Data = @ptrCast(@alignCast(instance_data));
-
     d.pool.deinit();
-
+    d.context.release();
     vsapi.?.freeNode.?(d.node);
     allocator.destroy(d);
 }
@@ -286,61 +414,149 @@ pub fn create(in: ?*const vs.Map, out: ?*vs.Map, _: ?*anyopaque, core: ?*vs.Core
     const map_out = zapi.initZMap(out);
 
     d.node, d.vi = map_in.getNodeVi("clip").?;
-    if (zapi.getVideoFormatID(d.vi) != .GrayS) {
-        map_out.setError("GaussBlur: test build, GRAYS format only.");
-        zapi.freeNode(d.node);
-        return;
-    }
+    var keep = false;
+    defer if (!keep) zapi.freeNode(d.node);
 
-    initOpenCL(&d) catch |err| {
-        map_out.setError("GaussBlur: OpenCL initialization failed.");
-        std.log.err("OpenCL initialization failed: {}", .{err});
-        zapi.freeNode(d.node);
-        return;
+    const fmt = d.vi.format;
+    const bits: i32 = fmt.bitsPerSample;
+    const depth_ok = (fmt.sampleType == .Float and (bits == 32 or bits == 16)) or
+        (fmt.sampleType == .Integer and (bits == 8 or bits == 16));
+    if (!depth_ok or d.vi.width <= 0 or d.vi.height <= 0 or
+        (fmt.colorFamily != .Gray and fmt.colorFamily != .YUV and fmt.colorFamily != .RGB))
+    {
+        return map_out.setError("GaussBlur: input bitdepth must be 8/16 (integer), 16 (half) or 32 (float), Gray/YUV/RGB.");
+    }
+    d.bits = bits;
+    d.half = fmt.sampleType == .Float and bits == 16;
+    d.bytes = @intCast(fmt.bytesPerSample);
+
+    const device_id = map_in.getValue(i32, "device_id") orelse 0;
+    if (device_id < 0) return map_out.setError("GaussBlur: invalid device ID.");
+    const ns_req = map_in.getValue(i32, "num_streams");
+    if (ns_req) |ns| if (ns < 1 or ns > 32) {
+        return map_out.setError("GaussBlur: num_streams must be 1..32.");
     };
 
-    var pad_size: u32 = std.simd.suggestVectorLength(u8) orelse 32;
-    pad_size = @divTrunc(@min(pad_size, 64), @as(u32, @intCast(d.vi.format.bytesPerSample)));
-    const stride: usize = vsh.ceilN(@intCast(d.vi.width), pad_size);
-    const height: usize = @intCast(d.vi.height);
-    d.buff_size = stride * height;
+    const subW: u5 = @intCast(fmt.subSamplingW);
+    const subH: u5 = @intCast(fmt.subSamplingH);
+    var sigma: [3]f32 = undefined;
+    {
+        var i: usize = 0;
+        while (i < 3) : (i += 1) {
+            if (map_in.getValue2(f32, "sigma", i)) |given| {
+                if (!math.isFinite(given) or given < 0)
+                    return map_out.setError("GaussBlur: sigma must be a finite value >= 0.");
+                sigma[i] = given;
+            } else if (i == 0) {
+                sigma[i] = 0.5;
+            } else if (i == 1) {
+                const prod = (@as(u32, 1) << subH) * (@as(u32, 1) << subW);
+                const sub_factor = @sqrt(@as(f64, @floatFromInt(prod)));
+                sigma[i] = @floatCast(@as(f64, sigma[0]) / sub_factor);
+            } else {
+                sigma[i] = sigma[i - 1];
+            }
+        }
+    }
 
-    const sigma = map_in.getValue(f32, "sigma") orelse 0.5;
-    const blur_weights = getGaussKernel(sigma) catch unreachable;
-    defer allocator.free(blur_weights);
-    d.ksize = @intCast(blur_weights.len);
-    d.blur_weights = blur_weights;
+    const num_planes: usize = @intCast(fmt.numPlanes);
+    var any_proc = false;
+    {
+        var i: usize = 0;
+        while (i < 3) : (i += 1) {
+            d.process[i] = i < num_planes and sigma[i] >= FLT_EPSILON;
+            if (d.process[i]) any_proc = true;
+        }
+    }
+    if (!any_proc) {
+        return map_out.setError("GaussBlur: all planes have sigma < FLT_EPSILON (nothing to process).");
+    }
+
+    const strides = vszipcl.strideFromVi(d.vi);
+    d.n_cfg = 0;
+    defer {
+        var wi: usize = 0;
+        while (wi < d.n_cfg) : (wi += 1) allocator.free(d.configs[wi].weights);
+    }
+    {
+        var pi: usize = 0;
+        while (pi < num_planes) : (pi += 1) {
+            if (!d.process[pi]) continue;
+            const key: Config.Key = .{
+                .w = if (pi == 0) d.vi.width else d.vi.width >> subW,
+                .h = if (pi == 0) d.vi.height else d.vi.height >> subH,
+                .stride = @intCast(if (pi == 0) strides[0] else strides[1]),
+                .sigma = sigma[pi],
+            };
+            var ci: usize = 0;
+            while (ci < d.n_cfg) : (ci += 1) {
+                if (std.meta.eql(key, d.configs[ci].key)) break;
+            }
+            if (ci == d.n_cfg) {
+                if (key.sigma > @as(f32, @floatFromInt(@min(key.w, key.h)))) {
+                    return map_out.setError("GaussBlur: sigma too large for plane (radius >= dimension).");
+                }
+                const weights = getGaussKernel(key.sigma) catch unreachable;
+                const ksize: i32 = @intCast(weights.len);
+                const radius = @divTrunc(ksize, 2);
+                if (radius > key.w - 1 or radius > key.h - 1) {
+                    allocator.free(weights);
+                    return map_out.setError("GaussBlur: sigma too large for plane (radius >= dimension).");
+                }
+                d.configs[ci] = .{
+                    .key = key,
+                    .ksize = ksize,
+                    .radius = radius,
+                    .mode = if (radius > large_path_radius_threshold) .large else .small,
+                    .weights = weights,
+                };
+                d.n_cfg += 1;
+            }
+            d.plane_cfg[pi] = ci;
+        }
+    }
+
+    d.buff_elems = 0;
+    d.any_large = false;
+    {
+        var ci: usize = 0;
+        while (ci < d.n_cfg) : (ci += 1) {
+            d.buff_elems = @max(d.buff_elems, d.configs[ci].extent());
+            if (d.configs[ci].mode == .large) d.any_large = true;
+        }
+        std.debug.assert(d.buff_elems > 0);
+    }
+
+    vszipcl.initContext(&d, @intCast(device_id)) catch |err| {
+        map_out.setError(if (err == error.InvalidDeviceID) "GaussBlur: invalid device ID." else "GaussBlur: OpenCL initialization failed.");
+        std.log.err("GaussBlur OpenCL init failed: {}", .{err});
+        return;
+    };
 
     d.pool = .{};
 
     const data: *Data = allocator.create(Data) catch unreachable;
     data.* = d;
 
-    // The separable read is slow on PoCL-CUDA; running a few frames concurrently
-    // lets those reads overlap. ~4 streams is the measured sweet spot (more adds
-    // contention), capped by the core thread count.
-    var info: vs.CoreInfo = .{};
-    zapi.getCoreInfo(core, &info);
-    const threads: usize = if (info.numThreads > 0) @intCast(info.numThreads) else 1;
-    const streams: usize = @min(max_streams, threads);
+    const streams: usize = if (ns_req) |ns| @intCast(ns) else 1;
     data.pool.prime(data, streams);
     data.pool.prewarm(streams) catch |err| {
         map_out.setError("GaussBlur: OpenCL stream init failed.");
         std.log.err("OpenCL stream init failed: {}", .{err});
         data.pool.deinit();
-        zapi.freeNode(d.node);
+        data.context.release();
         allocator.destroy(data);
         return;
     };
+
+    keep = true;
 
     var dep = [_]vs.FilterDependency{
         .{ .source = d.node, .requestPattern = .StrictSpatial },
     };
 
-    zapi.createVideoFilter(out, "GaussBlur", d.vi, getFrame, free, .Unordered, &dep, data);
+    zapi.createVideoFilter(out, "GaussBlur", d.vi, getFrame, free, .Parallel, &dep, data);
 }
-
-const max_streams: usize = 4;
 
 fn getGaussKernel(sigma: f32) ![]f32 {
     var taps: usize = @intFromFloat(@ceil(sigma * 6 + 1));

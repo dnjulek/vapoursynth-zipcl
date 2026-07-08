@@ -1,0 +1,6 @@
+# EEDI3 (vertical) — vszipcl (OpenCL). num_streams from BENCH_NS.
+import sys, os
+sys.path.insert(0, os.getcwd())  # vspipe runs from the script dir (has _bench.py)
+import _bench
+_bench.load_vszipcl()
+_bench.source().vszipcl.EEDI3(field=1, mdis=40, nrad=3, num_streams=_bench.ns()).set_output(0)

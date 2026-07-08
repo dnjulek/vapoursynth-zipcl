@@ -11,19 +11,52 @@ const bilateral = @import("bilateral.zig");
 const gaussglur = @import("gaussglur.zig");
 const eedi3 = @import("eedi3.zig");
 const nlmeans = @import("nlmeans.zig");
+const deband = @import("deband.zig");
 
-const eedi3_sig = "clip:vnode;field:int;dh:int:opt;mdis:int:opt;nrad:int:opt;alpha:float:opt;beta:float:opt;gamma:float:opt;hp:int:opt;vcheck:int:opt;vthresh0:float:opt;vthresh1:float:opt;vthresh2:float:opt;sclip:vnode:opt;";
+pub const io: std.Io = std.Io.Threaded.global_single_threaded.io();
+
+const eedi3_sig = "clip:vnode;field:int;dh:int:opt;mdis:int:opt;nrad:int:opt;alpha:float:opt;beta:float:opt;gamma:float:opt;hp:int:opt;vcheck:int:opt;vthresh0:float:opt;vthresh1:float:opt;vthresh2:float:opt;sclip:vnode:opt;device_id:int:opt;num_streams:int:opt;";
 
 export fn VapourSynthPluginInit2(plugin: *vs.Plugin, vspapi: *const vs.PLUGINAPI) void {
     ZAPI.Plugin.config("com.julek.vszipcl", "vszipcl", "VapourSynth Zig Image Process OpenCL", zon.version, plugin, vspapi);
-    ZAPI.Plugin.function("Bilateral", "clip:vnode;sigma_spatial:float[]:opt;sigma_color:float[]:opt;radius:int[]:opt;", "clip:vnode;", bilateral.create, plugin, vspapi);
-    ZAPI.Plugin.function("GaussBlur", "clip:vnode;sigma:float[]:opt;", "clip:vnode;", gaussglur.create, plugin, vspapi);
+    ZAPI.Plugin.function("Bilateral", "clip:vnode;sigma_spatial:float[]:opt;sigma_color:float[]:opt;radius:int[]:opt;device_id:int:opt;num_streams:int:opt;use_shared_memory:int:opt;ref:vnode:opt;", "clip:vnode;", bilateral.create, plugin, vspapi);
+    ZAPI.Plugin.function("GaussBlur", "clip:vnode;sigma:float[]:opt;device_id:int:opt;num_streams:int:opt;", "clip:vnode;", gaussglur.create, plugin, vspapi);
     ZAPI.Plugin.function("EEDI3", eedi3_sig, "clip:vnode;", eedi3.createEEDI3, plugin, vspapi);
     ZAPI.Plugin.function("EEDI3H", eedi3_sig, "clip:vnode;", eedi3.createEEDI3H, plugin, vspapi);
-    ZAPI.Plugin.function("NLMeans", "clip:vnode;d:int:opt;a:int:opt;s:int:opt;h:float:opt;wmode:int:opt;wref:float:opt;rclip:vnode:opt;", "clip:vnode;", nlmeans.create, plugin, vspapi);
+    ZAPI.Plugin.function("NLMeans", "clip:vnode;d:int:opt;a:int:opt;s:int:opt;h:float:opt;channels:data:opt;wmode:int:opt;wref:float:opt;rclip:vnode:opt;device_id:int:opt;num_streams:int:opt;", "clip:vnode;", nlmeans.create, plugin, vspapi);
+    ZAPI.Plugin.function("Deband", "clip:vnode;iterations:int:opt;threshold:float:opt;radius:float:opt;grain:float:opt;planes:int[]:opt;dither:int:opt;dither_algo:int:opt;device_id:int:opt;num_streams:int:opt;", "clip:vnode;", deband.create, plugin, vspapi);
 }
 
-/// [luma, chroma] stride
+pub fn initContext(d: anytype, device_id: usize) !void {
+    const a = std.heap.c_allocator;
+    const platforms = try cl.getPlatforms(a);
+    defer a.free(platforms);
+    if (platforms.len == 0) return error.NoPlatforms;
+    const platform = platforms[0];
+    const devices = try platform.getDevices(a, cl.DeviceType.all);
+    defer a.free(devices);
+    if (devices.len == 0) return error.NoDevices;
+    if (device_id >= devices.len) return error.InvalidDeviceID;
+    d.device = devices[device_id];
+    d.platform = platform;
+    d.context = try cl.createContext(&.{d.device}, .{ .platform = d.platform });
+}
+
+pub fn ndr(s: anytype, k: cl.Kernel, gws: []const usize, lws: []const usize) !void {
+    if (cl.c.clEnqueueNDRangeKernel(s.queue.handle, k.handle, @intCast(gws.len), null, gws.ptr, lws.ptr, 0, null, null) != cl.c.CL_SUCCESS)
+        return error.EnqueueKernel;
+}
+
+pub fn enqWrite(queue: cl.CommandQueue, mem: cl.c.cl_mem, offset: usize, src: []const u8) !void {
+    if (cl.c.clEnqueueWriteBuffer(queue.handle, mem, cl.c.CL_FALSE, offset, src.len, src.ptr, 0, null, null) != cl.c.CL_SUCCESS)
+        return error.EnqueueWrite;
+}
+
+pub fn enqRead(queue: cl.CommandQueue, mem: cl.c.cl_mem, offset: usize, dst: []u8) !void {
+    if (cl.c.clEnqueueReadBuffer(queue.handle, mem, cl.c.CL_FALSE, offset, dst.len, dst.ptr, 0, null, null) != cl.c.CL_SUCCESS)
+        return error.EnqueueRead;
+}
+
 pub fn strideFromVi(vi: *const vs.VideoInfo) [2]u32 {
     const n: u32 = @divExact(vsFrameAlignment(), @as(u32, @intCast(vi.format.bytesPerSample)));
     const ssw: u3 = @intCast(vi.format.subSamplingW);
@@ -33,23 +66,15 @@ pub fn strideFromVi(vi: *const vs.VideoInfo) [2]u32 {
     };
 }
 
-/// VapourSynth aligns every frame's plane rows to `VSFrame::alignment` bytes,
-/// which it picks once at startup from the *running* CPU: 64 bytes when AVX-512F
-/// is available, otherwise 32 (and 32 on non-x86) — see `alignmentHelper()` in vscore.cpp.
 pub fn vsFrameAlignment() u32 {
     if (comptime (builtin.cpu.arch == .x86_64 or builtin.cpu.arch == .x86)) {
-        // Replicates cpufeatures.cpp's `avx512_f` derivation exactly.
-        // 1. CPUID.1:ECX must report OSXSAVE(27) + AVX(28).
         const leaf1 = cpuid(1, 0);
         const osxsave_avx: u32 = (1 << 27) | (1 << 28);
         if ((leaf1.ecx & osxsave_avx) != osxsave_avx) return 32;
 
-        // 2. The OS must have enabled AVX state (XCR0 XMM+YMM bits).
         const xcr0 = getXCR0();
         if ((xcr0 & 0x06) != 0x06) return 32;
 
-        // 3. AVX-512F (CPUID.7.0:EBX bit 16) AND OS-enabled AVX-512 state (XCR0
-        //    opmask+ZMM bits) => 64-byte frames, matching VSFrame::alignment.
         const leaf7 = cpuid(7, 0);
         if ((leaf7.ebx & (1 << 16)) != 0 and (xcr0 & 0xE0) == 0xE0) return 64;
     }
@@ -74,7 +99,6 @@ fn cpuid(leaf: u32, subleaf: u32) CpuidLeaf {
     return .{ .eax = eax, .ebx = ebx, .ecx = ecx, .edx = edx };
 }
 
-/// Read XCR0 (low 32 bits hold every AVX / AVX-512 state bit we test).
 fn getXCR0() u32 {
     return asm volatile (
         \\ xor %%ecx, %%ecx

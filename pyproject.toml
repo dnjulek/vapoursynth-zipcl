@@ -1,0 +1,52 @@
+[build-system]
+requires = ["hatchling>=1.29.0", "packaging", "ziglang==0.16.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "vapoursynth-vszipcl"
+description = "VapourSynth Zig Image Process — OpenCL"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.12"
+dependencies = ["VapourSynth>=75"]
+dynamic = ["version"]
+
+[project.optional-dependencies]
+test = ["pytest", "numpy"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+markers = [
+    "golden: device-specific snapshot test (deselect on a non-reference OpenCL device with -m 'not golden')",
+]
+filterwarnings = [
+    # VapourSynth-internal deprecation raised when reading frame props; not our code.
+    "ignore:The _ColorRange frame property has been deprecated:DeprecationWarning",
+]
+
+[tool.hatch.version]
+source = "regex"
+path = "build.zig.zon"
+pattern = '\.version\s*=\s*"(?P<version>[^"]+)"'
+
+[tool.hatch.build.targets.sdist]
+only-include = [
+    "src",
+    "build.zig",
+    "build.zig.zon",
+    "README.md",
+    "LICENSE",
+]
+
+[tool.hatch.build.targets.wheel]
+include = ["vapoursynth/plugins/vszipcl"]
+artifacts = [
+    "vapoursynth/plugins/vszipcl/*.dylib",
+    "vapoursynth/plugins/vszipcl/*.so",
+    "vapoursynth/plugins/vszipcl/*.dll",
+    "vapoursynth/plugins/vszipcl/manifest.vs",
+]
+
+[tool.hatch.build.targets.wheel.hooks.custom]
+path = "hatch_build.py"
