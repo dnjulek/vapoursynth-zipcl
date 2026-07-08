@@ -15,7 +15,7 @@ const mdis_max = 40;
 const tpitch_max = 2 * mdis_max + 1;
 
 const kernel_src =
-    \\#define TPMAX 83  /* tpitch_max + 2 sentinels */
+    \\#define TPMAX 85  /* tpitch_max + 4 sentinels (2 per side; K=2 fused DP reads tid..tid+4) */
     \\#define FLTMAX9 3.0e38f
     \\#ifndef CN
     \\#define CN 2      /* = nrad; overridden by -DCN=<nrad> at build time so the
@@ -86,13 +86,15 @@ const kernel_src =
     \\// global = (pad+w+pad, src_h).
     \\// The io->f32 conversion happens HERE (LOAD_IO), once per padded column — the entire
     \\// downstream pipeline (pad_hp, costs, DP, interp reads) then works on f32 srcpad rows.
+    \\// soff: the plane's element offset into the src REGION buffer (0 unless vcheck>0
+    \\// multi-plane, where d_src holds every plane so the fused vcheck can read them all).
     \\kernel void pad_src(global float *out, global const io_t *src,
     \\                    const int w, const int stride, const int pstride,
-    \\                    const int pad, const int src_h) {
+    \\                    const int pad, const int src_h, const int soff) {
     \\    const int px = get_global_id(0);     // padded column [0, pad+w+pad)
     \\    const int y  = get_global_id(1);
     \\    if (px >= pad + w + pad || y >= src_h) return;
-    \\    out[y*pstride + px] = LOAD_IO(src, y*stride + refl(px - pad, w));
+    \\    out[y*pstride + px] = LOAD_IO(src, soff + y*stride + refl(px - pad, w));
     \\}
     \\
     \\// Half-pel companion of pad_src (only used when hp=1): hpout[y][px] is the cubic
@@ -139,58 +141,124 @@ const kernel_src =
     \\    return alpha * sw + beta * (float)abs(u) + one_minus_ab * v;
     \\}
     \\
-    \\// PAIRED connection cost: (cost(x,+u), cost(x,-u)) for u > 0 in one call. The two
-    \\// costs read the SAME five column-windows per row array — the index sets of +u
-    \\// ({u,-u,0,-2u,2u} + offsets k) and of -u are identical, negation only permutes
-    \\// which window feeds which term — so the 20 loads per k serve BOTH costs (vs 2x16
-    \\// separately; the cost fill is the LSU-bound 60%+ of the frame, see the strip-fill
-    \\// comment on `interp`). BIT-EXACT: each cost's accumulation statements below are
-    \\// conn_cost's statements VERBATIM (same values, same grouping, same order — swp/swm
-    \\// get their a0-, a1-, a2-group in the original per-k sequence); only WHERE the
-    \\// operands come from (a register instead of a repeated load) changes, which cannot
-    \\// alter a float. The tails replicate conn_cost's tail expression per sign.
-    \\static float2 conn_cost_pair(global const float * restrict r3p, global const float * restrict r1p,
-    \\                             global const float * restrict r1n, global const float * restrict r3n,
-    \\                             const int x, const int u, const int w, const int nrad,
-    \\                             const int pad,
-    \\                             const float alpha, const float beta, const float one_minus_ab) {
+    \\// ---- h-precompute cost fill (round 4) ----
+    \\// The cost algebra: with h_{+u}(c) = fabs(r3p[c]-r1p[c-2u]) + fabs(r1p[c]-r1n[c-2u]) +
+    \\// fabs(r1n[c]-r3n[c-2u]) (ONE statement, 3 fabs L-to-R — VERBATIM one accumulation
+    \\// statement of conn_cost) and h_{-u} its c+2u mirror, conn_cost's loop is EXACTLY
+    \\//   for k: sw += h_u(xp+u+k); sw += h_u(xp+k); sw += h_u(xp+2u+k);
+    \\// i.e. three sliding windows of one per-(row,u) column function. A run of RUN
+    \\// consecutive x at fixed u therefore needs only the 6 right-edge h values per new x
+    \\// (each window slides by exactly +1), cutting the fill's loads/cost ~73 -> ~20-32
+    \\// (the fill was measured 64% of the frame). BIT-EXACT: every h value is the original
+    \\// expression tree on the same addresses (no muls in h or the window sums -> no
+    \\// FMA-contraction freedom), each accumulator adds the same value sequence in the
+    \\// same per-k interleaved order, and the tails are conn_cost_pair's trees verbatim.
+    \\#define CW (2*CN + 1)          /* h-window length: 2*nrad+1 */
+    \\#ifndef RUN
+    \\#define RUN 8                  /* consecutive x per fill unit; BX % RUN == 0 */
+    \\#endif
+    \\#ifndef RUN_HP
+    \\#define RUN_HP 4               /* hp run length: 4 measured ~+4% over 8 (the hp kernel
+    \\                                  sits at the 96-reg cap, shorter runs ease the pressure;
+    \\                                  16 collapsed hp ~-17%). BX % RUN_HP == 0. */
+    \\#endif
+    \\
+    \\static float h_pos(global const float * restrict r3p, global const float * restrict r1p,
+    \\                   global const float * restrict r1n, global const float * restrict r3n,
+    \\                   const int c, const int two_u) {
+    \\    const int b = c - two_u;
+    \\    return fabs(r3p[c]-r1p[b]) + fabs(r1p[c]-r1n[b]) + fabs(r1n[c]-r3n[b]);
+    \\}
+    \\static float h_neg(global const float * restrict r3p, global const float * restrict r1p,
+    \\                   global const float * restrict r1n, global const float * restrict r3n,
+    \\                   const int c, const int two_u) {
+    \\    const int b = c + two_u;
+    \\    return fabs(r3p[c]-r1p[b]) + fabs(r1p[c]-r1n[b]) + fabs(r1n[c]-r3n[b]);
+    \\}
+    \\// both signs at the SAME c: the 3 center loads are shared (9 loads for 2 h values)
+    \\static float2 h_pair(global const float * restrict r3p, global const float * restrict r1p,
+    \\                     global const float * restrict r1n, global const float * restrict r3n,
+    \\                     const int c, const int two_u) {
+    \\    const float A = r3p[c], B = r1p[c], C = r1n[c];
+    \\    const float Bm = r1p[c-two_u], Cm = r1n[c-two_u], Dm = r3n[c-two_u];
+    \\    const float Bp = r1p[c+two_u], Cp = r1n[c+two_u], Dp = r3n[c+two_u];
+    \\    return (float2)(fabs(A-Bm) + fabs(B-Cm) + fabs(C-Dm),     /* h_{+u}(c) */
+    \\                    fabs(A-Bp) + fabs(B-Cp) + fabs(C-Dp));    /* h_{-u}(c) */
+    \\}
+    \\
+    \\// RUN-batched pair fill unit: cost(x,+u) and cost(x,-u) for x = xs .. xs+rl-1 into
+    \\// co (= cst + dx0*TP). Six register windows, index t <-> column (x + delta - CN + t):
+    \\//   wp1: h_{+u} @ x+u+k | wp0: h_{+u} @ x+k | wp2: h_{+u} @ x+2u+k
+    \\//   wm1: h_{-u} @ x-u+k | wm0: h_{-u} @ x+k | wm2: h_{-u} @ x-2u+k
+    \\static void cost_pair_run(global const float * restrict r3p, global const float * restrict r1p,
+    \\                          global const float * restrict r1n, global const float * restrict r3n,
+    \\                          local float *co, const int xs, const int rl, const int u,
+    \\                          const int pad, const float alpha, const float beta,
+    \\                          const float one_minus_ab)
+    \\{
     \\    const int two_u = 2*u;
-    \\    const int xp = x + pad;
-    \\    float swp = 0.0f, swm = 0.0f;
+    \\    const int x0p = xs + pad;
+    \\    float wp1[CW], wp0[CW], wp2[CW], wm1[CW], wm0[CW], wm2[CW];
     \\    #pragma unroll
-    \\    for (int k = -CN; k <= CN; k++) {
-    \\        const int p2 = xp+two_u+k, p1 = xp+u+k, c0 = xp+k, m1 = xp-u+k, m2 = xp-two_u+k;
-    \\        const float A_p2=r3p[p2], A_p1=r3p[p1], A_c0=r3p[c0], A_m1=r3p[m1], A_m2=r3p[m2];
-    \\        const float B_p2=r1p[p2], B_p1=r1p[p1], B_c0=r1p[c0], B_m1=r1p[m1], B_m2=r1p[m2];
-    \\        const float C_p2=r1n[p2], C_p1=r1n[p1], C_c0=r1n[c0], C_m1=r1n[m1], C_m2=r1n[m2];
-    \\        const float D_p2=r3n[p2], D_p1=r3n[p1], D_c0=r3n[c0], D_m1=r3n[m1], D_m2=r3n[m2];
-    \\        // +u: a0=p1 b0=m1 | a1=c0 b1=m2 | a2=p2 b2=c0   (conn_cost's three statements)
-    \\        swp += fabs(A_p1-B_m1) + fabs(B_p1-C_m1) + fabs(C_p1-D_m1);
-    \\        swp += fabs(A_c0-B_m2) + fabs(B_c0-C_m2) + fabs(C_c0-D_m2);
-    \\        swp += fabs(A_p2-B_c0) + fabs(B_p2-C_c0) + fabs(C_p2-D_c0);
-    \\        // -u: a0=m1 b0=p1 | a1=c0 b1=p2 | a2=m2 b2=c0
-    \\        swm += fabs(A_m1-B_p1) + fabs(B_m1-C_p1) + fabs(C_m1-D_p1);
-    \\        swm += fabs(A_c0-B_p2) + fabs(B_c0-C_p2) + fabs(C_c0-D_p2);
-    \\        swm += fabs(A_m2-B_c0) + fabs(B_m2-C_c0) + fabs(C_m2-D_c0);
+    \\    for (int t = 0; t < CW; t++) {              /* prime the six windows at x = xs */
+    \\        const int c = x0p - CN + t;
+    \\        const float2 hc = h_pair(r3p,r1p,r1n,r3n, c, two_u);
+    \\        wp0[t] = hc.x;  wm0[t] = hc.y;
+    \\        wp1[t] = h_pos(r3p,r1p,r1n,r3n, c + u,     two_u);
+    \\        wp2[t] = h_pos(r3p,r1p,r1n,r3n, c + two_u, two_u);
+    \\        wm1[t] = h_neg(r3p,r1p,r1n,r3n, c - u,     two_u);
+    \\        wm2[t] = h_neg(r3p,r1p,r1n,r3n, c - two_u, two_u);
     \\    }
-    \\    // Tails: expression trees kept VERBATIM per sign (no shared temps in the final
-    \\    // sum — a hoisted beta*|u| could change the compiler's FMA contraction shape).
-    \\    const float b1pc = r1p[xp], b1nc = r1n[xp];
-    \\    float ipp = (r1p[xp+u] + r1n[xp-u]) * 0.5f;
-    \\    float vp = fabs(b1pc - ipp) + fabs(b1nc - ipp);
-    \\    float ipm = (r1p[xp-u] + r1n[xp+u]) * 0.5f;
-    \\    float vm = fabs(b1pc - ipm) + fabs(b1nc - ipm);
-    \\    return (float2)(alpha * swp + beta * (float)abs(u) + one_minus_ab * vp,
-    \\                    alpha * swm + beta * (float)abs(u) + one_minus_ab * vm);
+    \\    #pragma unroll
+    \\    for (int t = 0; t < RUN; t++) {
+    \\        if (t >= rl) break;
+    \\        const int xp = x0p + t;
+    \\        float swp = 0.0f, swm = 0.0f;
+    \\        #pragma unroll
+    \\        for (int k = 0; k < CW; k++) {          /* ORIGINAL per-k interleave: a0,a1,a2 */
+    \\            swp += wp1[k]; swp += wp0[k]; swp += wp2[k];
+    \\            swm += wm1[k]; swm += wm0[k]; swm += wm2[k];
+    \\        }
+    \\        // Tails: expression trees kept VERBATIM per sign (no shared temps in the final
+    \\        // sum — a hoisted beta*|u| could change the compiler's FMA contraction shape).
+    \\        const float b1pc = r1p[xp], b1nc = r1n[xp];
+    \\        float ipp = (r1p[xp+u] + r1n[xp-u]) * 0.5f;
+    \\        float vp = fabs(b1pc - ipp) + fabs(b1nc - ipp);
+    \\        float ipm = (r1p[xp-u] + r1n[xp+u]) * 0.5f;
+    \\        float vm = fabs(b1pc - ipm) + fabs(b1nc - ipm);
+    \\        co[t*TP + (MDIS + u)] = alpha * swp + beta * (float)abs(u) + one_minus_ab * vp;
+    \\        co[t*TP + (MDIS - u)] = alpha * swm + beta * (float)abs(u) + one_minus_ab * vm;
+    \\        if (t + 1 < rl) {                       /* slide all six windows by +1 */
+    \\            #pragma unroll
+    \\            for (int k = 0; k < CW-1; k++) {
+    \\                wp1[k]=wp1[k+1]; wp0[k]=wp0[k+1]; wp2[k]=wp2[k+1];
+    \\                wm1[k]=wm1[k+1]; wm0[k]=wm0[k+1]; wm2[k]=wm2[k+1];
+    \\            }
+    \\            const int c = xp + 1 + CN;          /* new right edge per window */
+    \\            const float2 hc = h_pair(r3p,r1p,r1n,r3n, c, two_u);
+    \\            wp0[CW-1] = hc.x;  wm0[CW-1] = hc.y;
+    \\            wp1[CW-1] = h_pos(r3p,r1p,r1n,r3n, c + u,     two_u);
+    \\            wp2[CW-1] = h_pos(r3p,r1p,r1n,r3n, c + two_u, two_u);
+    \\            wm1[CW-1] = h_neg(r3p,r1p,r1n,r3n, c - u,     two_u);
+    \\            wm2[CW-1] = h_neg(r3p,r1p,r1n,r3n, c - two_u, two_u);
+    \\        }
+    \\    }
     \\}
     \\
     \\// Copy the kept field rows from src into dst, and (when vcheck off) acts as a
     \\// no-op for interp rows. global = (w, dst_h). raw_t: a VERBATIM bit-pattern element
     \\// copy so kept rows are BIT-LOSSLESS for every io type (u8/u16/f16/f32 alike) — do
     \\// NOT route this through LOAD_IO/STORE_IO (a decode+re-encode round-trip).
+    \\// dual=1 (vcheck on): ALSO write dst2, seeding the vcheck output buffer's kept rows
+    \\// directly — replaces the old whole-frame clEnqueueCopyBuffer(dst->dst2) (same bytes,
+    \\// written once here instead of copied device-side; the interp kernels seed the interp
+    \\// rows the same way). dual=0 binds a 1-byte dummy dst2 that is never touched.
+    \\// soff/doff: plane element offsets into the src/dst(+dst2) region buffers (see pad_src).
     \\kernel void copy_kept(global raw_t *dst, global const raw_t *src,
     \\                      const int w, const int stride, const int dh,
-    \\                      const int field, const int src_h, const int dst_h) {
+    \\                      const int field, const int src_h, const int dst_h,
+    \\                      global raw_t *dst2, const int dual,
+    \\                      const int soff, const int doff) {
     \\    const int x = get_global_id(0);
     \\    const int y = get_global_id(1);
     \\    if (x >= w || y >= dst_h) return;
@@ -203,7 +271,11 @@ const kernel_src =
     \\        is_interp = ((y & 1) == field);
     \\        if (!is_interp) sy = y;
     \\    }
-    \\    if (!is_interp) dst[y*stride + x] = src[sy*stride + x];
+    \\    if (!is_interp) {
+    \\        const raw_t v = src[soff + sy*stride + x];
+    \\        dst[doff + y*stride + x] = v;
+    \\        if (dual) dst2[doff + y*stride + x] = v;
+    \\    }
     \\}
     \\
     \\// One workgroup per interpolated row. local_size = padded tpitch.
@@ -225,7 +297,9 @@ const kernel_src =
     \\                   const int w, const int stride, const int pstride, const int pad,
     \\                   const int mdis, const int nrad,
     \\                   const float alpha, const float beta, const float gamma,
-    \\                   const float one_minus_ab) {
+    \\                   const float one_minus_ab,
+    \\                   global io_t * restrict dst2, const int dual,
+    \\                   const int doff, const int moff) {
     \\    const int off = get_global_id(1);
     \\    const int tid = get_local_id(0);
     \\    const int lsz = get_local_size(0);
@@ -242,43 +316,102 @@ const kernel_src =
     \\    const int u = tid - MDIS;          // direction for this thread (valid if tid<TP)
     \\    const int active = (tid < TP);
     \\
-    \\    // sentinels
-    \\    if (tid == 0) { pc[0][0]=FLTMAX9; pc[1][0]=FLTMAX9; pc[0][TP+1]=FLTMAX9; pc[1][TP+1]=FLTMAX9; }
+    \\    // sentinels: TWO per side (positions {0,1} and {TP+2,TP+3}; lane t's slot is t+2)
+    \\    // for the K=2 fused DP step, which reads pc[tid..tid+4]. Sentinels are never
+    \\    // relaxed — they stay FLTMAX9 forever, exactly like the old single sentinels.
+    \\    if (tid == 0) {
+    \\        pc[0][0]=FLTMAX9; pc[0][1]=FLTMAX9; pc[1][0]=FLTMAX9; pc[1][1]=FLTMAX9;
+    \\        pc[0][TP+2]=FLTMAX9; pc[0][TP+3]=FLTMAX9; pc[1][TP+2]=FLTMAX9; pc[1][TP+3]=FLTMAX9;
+    \\    }
     \\    barrier(CLK_LOCAL_MEM_FENCE);
     \\
     \\    int ping = 0;
-    \\    if (active) pc[ping][tid+1] = conn_cost(r3p,r1p,r1n,r3n, 0, u, w, nrad, pad, alpha, beta, one_minus_ab);
+    \\    if (active) pc[ping][tid+2] = conn_cost(r3p,r1p,r1n,r3n, 0, u, w, nrad, pad, alpha, beta, one_minus_ab);
     \\    barrier(CLK_LOCAL_MEM_FENCE);
     \\
-    \\    #define NUNIT (MDIS + 1)   /* fill units per x: u=0 single + MDIS (+u,-u) pairs */
+    \\    #define NUNIT (MDIS + 1)   /* fill units per x-run: u=0 single + MDIS (+u,-u) pairs */
     \\    for (int x0 = 1; x0 < w; x0 += BX) {
     \\        const int bn = min(BX, w - x0);
-    \\        // cooperative fill in (+u,-u) PAIR units: both costs of a pair read the same
-    \\        // 20 values per k (see conn_cost_pair), so pairing nearly halves the fill's
-    \\        // load count — the LSU-bound bulk of this kernel. i/NUNIT is a mul-shift.
-    \\        for (int i = tid; i < bn*NUNIT; i += lsz) {
-    \\            const int dx = i / NUNIT;
-    \\            const int j  = i - dx*NUNIT;
+    \\        // cooperative fill in (pair, RUN-of-x) units: each lane slides six register
+    \\        // h-windows across RUN consecutive x at its pair's u (see cost_pair_run) —
+    \\        // the LSU-bound bulk of this kernel drops ~2.3-3x in loads. i/NUNIT stays
+    \\        // the same baked mul-shift; r (run index) is the slow axis so consecutive
+    \\        // lanes keep consecutive u (coalescing unchanged).
+    \\        const int nrun = (bn + RUN - 1) / RUN;
+    \\        for (int i = tid; i < nrun*NUNIT; i += lsz) {
+    \\            const int r  = i / NUNIT;
+    \\            const int j  = i - r*NUNIT;
+    \\            const int xs = x0 + r*RUN;
+    \\            const int rl = min(RUN, bn - r*RUN);
+    \\            local float *co = cst + (r*RUN)*TP;
     \\            if (j == 0) {
-    \\                cst[dx*TP + MDIS] = conn_cost(r3p,r1p,r1n,r3n, x0+dx, 0, w, nrad, pad, alpha, beta, one_minus_ab);
+    \\                for (int t = 0; t < rl; t++)    /* u=0: original conn_cost, per x */
+    \\                    co[t*TP + MDIS] = conn_cost(r3p,r1p,r1n,r3n, xs+t, 0, w, nrad, pad, alpha, beta, one_minus_ab);
     \\            } else {
-    \\                const float2 cc = conn_cost_pair(r3p,r1p,r1n,r3n, x0+dx, j, w, nrad, pad, alpha, beta, one_minus_ab);
-    \\                cst[dx*TP + (MDIS + j)] = cc.x;
-    \\                cst[dx*TP + (MDIS - j)] = cc.y;
+    \\                cost_pair_run(r3p,r1p,r1n,r3n, co, xs, rl, j, pad, alpha, beta, one_minus_ab);
     \\            }
     \\        }
     \\        barrier(CLK_LOCAL_MEM_FENCE);
-    \\        for (int dx = 0; dx < bn; dx++) {
+    \\        // K=2 FUSED DP: one barrier per TWO columns. Each lane redundantly recomputes its
+    \\        // neighbours' column-x relaxes (qL/qR, VALUE only) plus its own (qC, emits the pb
+    \\        // byte), then relaxes column x+1 from those registers — the intermediate pc state
+    \\        // never touches local. BIT-EXACT: the relax contains NO multiplies (only fadd,
+    \\        // strict-less-than select and fmin, all exactly rounded; no fast-math flags), so
+    \\        // a verbatim clone fed the same inputs produces the same bits under any schedule;
+    \\        // the tie-break chain (cent, then left, then right, strict <) and the
+    \\        // fmin(bval+cost, FLTMAX9) clamp placement are cloned per sub-step; sentinel
+    \\        // positions are never relaxed (the tid==0 / tid==TP-1 overrides reproduce exactly
+    \\        // the FLTMAX9 a real sentinel read returns; their clamped cst reads are discarded).
+    \\        int dx = 0;
+    \\        for (; dx + 1 < bn; dx += 2) {
+    \\            const int pong = ping ^ 1;
+    \\            if (active) {
+    \\                const float p0 = pc[ping][tid];
+    \\                const float p1 = pc[ping][tid+1];
+    \\                const float p2 = pc[ping][tid+2];   // own slot
+    \\                const float p3 = pc[ping][tid+3];
+    \\                const float p4 = pc[ping][tid+4];
+    \\                const float cL = cst[dx*TP + max(tid-1, 0)];      // value discarded on edge lane
+    \\                const float cC = cst[dx*TP + tid];
+    \\                const float cR = cst[dx*TP + min(tid+1, TP-1)];   // value discarded on edge lane
+    \\                const float cN = cst[(dx+1)*TP + tid];
+    \\                // relax_x at slot tid+1 (dir u-1): VALUE only
+    \\                float lft = p0 + gamma, cnt = p1, rgt = p2 + gamma;
+    \\                float bL = cnt; if (lft < bL) bL = lft; if (rgt < bL) bL = rgt;
+    \\                const float qL = (tid == 0) ? FLTMAX9 : fmin(bL + cL, FLTMAX9);
+    \\                // relax_x at own slot tid+2: VALUE + column-x pb byte (delta stored at x-1)
+    \\                lft = p1 + gamma; cnt = p2; rgt = p3 + gamma;
+    \\                float bC = cnt; char bdC = 0;
+    \\                if (lft < bC) { bC = lft; bdC = -1; }
+    \\                if (rgt < bC) { bC = rgt; bdC =  1; }
+    \\                const float qC = fmin(bC + cC, FLTMAX9);
+    \\                pb[(x0+dx-1)*TP + tid] = bdC;
+    \\                // relax_x at slot tid+3 (dir u+1): VALUE only
+    \\                lft = p2 + gamma; cnt = p3; rgt = p4 + gamma;
+    \\                float bR = cnt; if (lft < bR) bR = lft; if (rgt < bR) bR = rgt;
+    \\                const float qR = (tid == TP-1) ? FLTMAX9 : fmin(bR + cR, FLTMAX9);
+    \\                // relax_{x+1} at own slot from the register intermediates
+    \\                lft = qL + gamma; cnt = qC; rgt = qR + gamma;
+    \\                float bN = cnt; char bdN = 0;
+    \\                if (lft < bN) { bN = lft; bdN = -1; }
+    \\                if (rgt < bN) { bN = rgt; bdN =  1; }
+    \\                pc[pong][tid+2] = fmin(bN + cN, FLTMAX9);
+    \\                pb[(x0+dx)*TP + tid] = bdN;
+    \\            }
+    \\            barrier(CLK_LOCAL_MEM_FENCE);
+    \\            ping = pong;                            // ONE flip per 2 columns
+    \\        }
+    \\        if (dx < bn) {                              // odd-bn tail: original single step
     \\            const int pong = ping ^ 1;
     \\            if (active) {
     \\                const float cost = cst[dx*TP + tid];
-    \\                float left  = pc[ping][tid]   + gamma;  // dir u-1
-    \\                float cent  = pc[ping][tid+1];          // dir u
-    \\                float right = pc[ping][tid+2] + gamma;  // dir u+1
+    \\                float left  = pc[ping][tid+1] + gamma;  // dir u-1
+    \\                float cent  = pc[ping][tid+2];          // dir u
+    \\                float right = pc[ping][tid+3] + gamma;  // dir u+1
     \\                float bval = cent; char bd = 0;
     \\                if (left  < bval) { bval = left;  bd = -1; }
     \\                if (right < bval) { bval = right; bd =  1; }
-    \\                pc[pong][tid+1] = fmin(bval + cost, FLTMAX9);
+    \\                pc[pong][tid+2] = fmin(bval + cost, FLTMAX9);
     \\                pb[(x0+dx-1)*TP + tid] = bd;   // CPU stores backtrack delta at x-1
     \\            }
     \\            barrier(CLK_LOCAL_MEM_FENCE);
@@ -290,19 +423,39 @@ const kernel_src =
     \\    // goes straight into this row's dmap slice (same values the interpolate stage used
     \\    // to store) — vcheck reads the identical dirs.
     \\    barrier(CLK_GLOBAL_MEM_FENCE | CLK_LOCAL_MEM_FENCE);
-    \\    global int *dm = dmap + (long)off*stride;
-    \\    if (tid == 0) {
+    \\    global int *dm = dmap + moff + (long)off*stride;
+    \\    // LOCAL-STAGED serial backtrack: the walk is w-1 DEPENDENT loads (f feeds the next
+    \\    // address), so its makespan is per-load latency x w. cst[] is DEAD after the last DP
+    \\    // strip, and pb's x-major layout makes a BTC-column band a CONTIGUOUS byte block —
+    \\    // so all lanes cooperatively stage each band into cst (coalesced), and thread 0 walks
+    \\    // LOCAL (~30 cy) instead of L2/DRAM (~400+ cy). BTC*TP bytes == sizeof(cst) exactly
+    \\    // (4*BX*TP == BX*TP*4). Identical bytes, identical f recurrence -> identical dm.
+    \\    {
+    \\        local char *stg = (local char *)cst;   // char, NOT uchar: bd deltas are SIGNED
     \\        int f = 0;
-    \\        dm[w-1] = 0;
-    \\        for (int bx = w-2; bx >= 0; bx--) {
-    \\            f += (int)pb[bx*TP + (MDIS + f)];
-    \\            dm[bx] = f;
+    \\        if (tid == 0) dm[w-1] = 0;
+    \\        for (int xhi = w-2; xhi >= 0; xhi -= 4*BX) {
+    \\            const int xlo = max(xhi - 4*BX + 1, 0);
+    \\            const int nb = (xhi - xlo + 1) * TP;
+    \\            for (int i = tid; i < nb; i += lsz)
+    \\                stg[i] = pb[xlo*TP + i];
+    \\            barrier(CLK_LOCAL_MEM_FENCE);
+    \\            if (tid == 0) {
+    \\                for (int bx = xhi; bx >= xlo; bx--) {
+    \\                    f += (int)stg[(bx - xlo)*TP + (MDIS + f)];
+    \\                    dm[bx] = f;
+    \\                }
+    \\            }
+    \\            barrier(CLK_LOCAL_MEM_FENCE);   // walk done before stg is overwritten
     \\        }
     \\    }
     \\    barrier(CLK_GLOBAL_MEM_FENCE | CLK_LOCAL_MEM_FENCE);  // dm[] must be visible to all
     \\
-    \\    // parallel interpolate (STORE_IO: the f32 result quantizes to the io type here)
-    \\    global io_t *drow = dst + dst_y[off]*stride;
+    \\    // parallel interpolate (STORE_IO: the f32 result quantizes to the io type here).
+    \\    // dual=1 (vcheck on): also seed the vcheck output buffer's interp rows — together
+    \\    // with copy_kept's dual store this fully replaces the old dst->dst2 device copy.
+    \\    global io_t *drow = dst + doff + dst_y[off]*stride;
+    \\    global io_t *drow2 = dst2 + doff + dst_y[off]*stride;
     \\    for (int x = tid; x < w; x += lsz) {
     \\        const int dir = dm[x];
     \\        int ad = abs(dir);
@@ -315,6 +468,7 @@ const kernel_src =
     \\            val = (r1p[xp+dir] + r1n[xp-dir]) * 0.5f;
     \\        }
     \\        STORE_IO(drow, x, val);
+    \\        if (dual) STORE_IO(drow2, x, val);
     \\    }
     \\}
     \\
@@ -354,63 +508,79 @@ const kernel_src =
     \\    return alpha3*(s0+s1+s2) + beta255*(float)abs(u)*0.5f + one_minus_ab*v;
     \\}
     \\
-    \\// PAIRED hp cost: (cost_hp(x,+u), cost_hp(x,-u)) for u > 0 (same parity — pairs are
-    \\// formed within each parity-split fill pass, so `odd` stays warp-uniform). The two
-    \\// costs share every window: xu(+u)=xmu(-u) and, because uh(-u) = lo0(+u) and
-    \\// lo0(-u) = uh(+u) for BOTH parities (arithmetic >> like the original), the hp/full
-    \\// hi/lo windows swap sides. 20 loads per k serve both costs (vs ~2x16). BIT-EXACT:
-    \\// per sign, s0/s1/s2 accumulate the original conn_cost_hp statements VERBATIM in the
-    \\// original per-k order, and the tail expression trees are replicated per sign.
-    \\static float2 conn_cost_hp_pair(global const float * restrict r3p, global const float * restrict r1p,
-    \\                                global const float * restrict r1n, global const float * restrict r3n,
-    \\                                global const float * restrict hp3p, global const float * restrict hp1p,
-    \\                                global const float * restrict hp1n, global const float * restrict hp3n,
-    \\                                const int x, const int u, const int w, const int nrad,
-    \\                                const float alpha3, const float beta255, const float one_minus_ab) {
+    \\// hp h-precompute fill (round 4, see the non-hp block): conn_cost_hp is window sums
+    \\// of the SAME h shape with partner distance u (not 2u) — s1 = SUM_k h1_{+u}(x+k),
+    \\// s2 = SUM_k h1_{+u}(x+u+k) over the full rows, and s0 = SUM_k g_{+u}(x+uh+k) over
+    \\// the parity-selected S rows (hp rows when odd, full rows when even; hi-lo == u for
+    \\// both parities under arithmetic >>, the shipped invariant). The h_pos/h_neg/h_pair
+    \\// helpers are reused with two_u := u. s0/s1/s2 stay SEPARATE accumulators (summed
+    \\// only in the tail, like the original), so each window sum needs only ITS OWN
+    \\// ascending-k order — bit-exact by the same argument as cost_pair_run.
+    \\// Six register windows per (pair, run) unit:
+    \\//   V0p: h1_{+u} @ x+k   | V1p: h1_{+u} @ x+u+k  | G0p: g_{+u} @ x+uh+k
+    \\//   V0m: h1_{-u} @ x+k   | V1m: h1_{-u} @ x-u+k  | G0m: g_{-u} @ x+lo0+k
+    \\static void cost_hp_pair_run(
+    \\        global const float * restrict r3p, global const float * restrict r1p,
+    \\        global const float * restrict r1n, global const float * restrict r3n,
+    \\        global const float * restrict S3p, global const float * restrict S1p,
+    \\        global const float * restrict S1n, global const float * restrict S3n,
+    \\        global const float * restrict Sel1p, global const float * restrict Sel1n,
+    \\        local float *co, const int xs, const int rl, const int u,
+    \\        const float alpha3, const float beta255, const float one_minus_ab)
+    \\{
     \\    const int uh = u >> 1;
-    \\    const int odd = u & 1;
-    \\    const int lo0 = odd ? (-uh - 1) : (-uh);       // == uh of -u (both parities)
-    \\    float s0p=0.0f, s1p=0.0f, s2p=0.0f;
-    \\    float s0m=0.0f, s1m=0.0f, s2m=0.0f;
+    \\    const int lo0 = (u & 1) ? (-uh - 1) : (-uh);   // == uh of -u (both parities)
+    \\    float V0p[CW], V0m[CW], V1p[CW], V1m[CW], G0p[CW], G0m[CW];
     \\    #pragma unroll
-    \\    for (int k=-CN; k<=CN; k++) {
-    \\        const int xk = x+k, hi = x+uh+k, lo = x+lo0+k, xu = x+u+k, xm = x-u+k;
-    \\        const float A0=R(r3p,xk), B0=R(r1p,xk), C0=R(r1n,xk), D0=R(r3n,xk);
-    \\        const float Au=R(r3p,xu), Bu=R(r1p,xu), Cu=R(r1n,xu), Du=R(r3n,xu);
-    \\        const float Am=R(r3p,xm), Bm=R(r1p,xm), Cm=R(r1n,xm), Dm=R(r3n,xm);
-    \\        // +u: s1 pairs xk with xmu=xm; s2 pairs xu with xk. -u: xu/xm swap roles.
-    \\        s1p += fabs(A0-Bm) + fabs(B0-Cm) + fabs(C0-Dm);
-    \\        s2p += fabs(Au-B0) + fabs(Bu-C0) + fabs(Cu-D0);
-    \\        s1m += fabs(A0-Bu) + fabs(B0-Cu) + fabs(C0-Du);
-    \\        s2m += fabs(Am-B0) + fabs(Bm-C0) + fabs(Cm-D0);
-    \\        if (odd) {
-    \\            const float h3p_h=hp3p[hi], h3p_l=hp3p[lo];
-    \\            const float h1p_h=hp1p[hi], h1p_l=hp1p[lo];
-    \\            const float h1n_h=hp1n[hi], h1n_l=hp1n[lo];
-    \\            const float h3n_h=hp3n[hi], h3n_l=hp3n[lo];
-    \\            s0p += fabs(h3p_h-h1p_l) + fabs(h1p_h-h1n_l) + fabs(h1n_h-h3n_l);
-    \\            s0m += fabs(h3p_l-h1p_h) + fabs(h1p_l-h1n_h) + fabs(h1n_l-h3n_h); // hi(-u)=lo, lo(-u)=hi
-    \\        } else {
-    \\            const float f3p_h=R(r3p,hi), f3p_l=R(r3p,lo);
-    \\            const float f1p_h=R(r1p,hi), f1p_l=R(r1p,lo);
-    \\            const float f1n_h=R(r1n,hi), f1n_l=R(r1n,lo);
-    \\            const float f3n_h=R(r3n,hi), f3n_l=R(r3n,lo);
-    \\            s0p += fabs(f3p_h-f1p_l) + fabs(f1p_h-f1n_l) + fabs(f1n_h-f3n_l);
-    \\            s0m += fabs(f3p_l-f1p_h) + fabs(f1p_l-f1n_h) + fabs(f1n_l-f3n_h);
+    \\    for (int t = 0; t < CW; t++) {                 /* prime at x = xs (rows pre-+pad) */
+    \\        const int c = xs - CN + t;
+    \\        const float2 hc = h_pair(r3p,r1p,r1n,r3n, c, u);
+    \\        V0p[t] = hc.x;  V0m[t] = hc.y;
+    \\        V1p[t] = h_pos(r3p,r1p,r1n,r3n, c + u, u);
+    \\        V1m[t] = h_neg(r3p,r1p,r1n,r3n, c - u, u);
+    \\        G0p[t] = h_pos(S3p,S1p,S1n,S3n, c + uh,  u);
+    \\        G0m[t] = h_neg(S3p,S1p,S1n,S3n, c + lo0, u);
+    \\    }
+    \\    #pragma unroll
+    \\    for (int t = 0; t < RUN_HP; t++) {
+    \\        if (t >= rl) break;
+    \\        const int x = xs + t;
+    \\        float s0p=0.0f, s1p=0.0f, s2p=0.0f;
+    \\        float s0m=0.0f, s1m=0.0f, s2m=0.0f;
+    \\        #pragma unroll
+    \\        for (int k = 0; k < CW; k++) {             /* per-accumulator ascending k */
+    \\            s1p += V0p[k]; s2p += V1p[k];
+    \\            s1m += V0m[k]; s2m += V1m[k];
+    \\            s0p += G0p[k]; s0m += G0m[k];
+    \\        }
+    \\        // Tails per sign, expression trees verbatim; Sel* == the parity-selected rows
+    \\        // (odd ? hp : full), so Sel1p[x+uh] == the original odd? ternary value.
+    \\        const float b1pc = R(r1p,x), b1nc = R(r1n,x);
+    \\        float Bxuh_p = Sel1p[x+uh];
+    \\        float Cxlo_p = Sel1n[x+lo0];
+    \\        float ip_p = (Bxuh_p + Cxlo_p) * 0.5f;
+    \\        float v_p = fabs(b1pc-ip_p) + fabs(b1nc-ip_p);
+    \\        float Bxuh_m = Sel1p[x+lo0];
+    \\        float Cxlo_m = Sel1n[x+uh];
+    \\        float ip_m = (Bxuh_m + Cxlo_m) * 0.5f;
+    \\        float v_m = fabs(b1pc-ip_m) + fabs(b1nc-ip_m);
+    \\        co[t*TPH + (2*MDIS + u)] = alpha3*(s0p+s1p+s2p) + beta255*(float)abs(u)*0.5f + one_minus_ab*v_p;
+    \\        co[t*TPH + (2*MDIS - u)] = alpha3*(s0m+s1m+s2m) + beta255*(float)abs(u)*0.5f + one_minus_ab*v_m;
+    \\        if (t + 1 < rl) {                          /* slide all six windows by +1 */
+    \\            #pragma unroll
+    \\            for (int k = 0; k < CW-1; k++) {
+    \\                V0p[k]=V0p[k+1]; V0m[k]=V0m[k+1]; V1p[k]=V1p[k+1];
+    \\                V1m[k]=V1m[k+1]; G0p[k]=G0p[k+1]; G0m[k]=G0m[k+1];
+    \\            }
+    \\            const int c = x + 1 + CN;
+    \\            const float2 hc = h_pair(r3p,r1p,r1n,r3n, c, u);
+    \\            V0p[CW-1] = hc.x;  V0m[CW-1] = hc.y;
+    \\            V1p[CW-1] = h_pos(r3p,r1p,r1n,r3n, c + u, u);
+    \\            V1m[CW-1] = h_neg(r3p,r1p,r1n,r3n, c - u, u);
+    \\            G0p[CW-1] = h_pos(S3p,S1p,S1n,S3n, c + uh,  u);
+    \\            G0m[CW-1] = h_neg(S3p,S1p,S1n,S3n, c + lo0, u);
     \\        }
     \\    }
-    \\    // Tails per sign, expression trees verbatim; x+uh(-u) = x+lo0, x+lo0(-u) = x+uh.
-    \\    const float b1pc = R(r1p,x), b1nc = R(r1n,x);
-    \\    float Bxuh_p = odd ? hp1p[x+uh]  : R(r1p,x+uh);
-    \\    float Cxlo_p = odd ? hp1n[x+lo0] : R(r1n,x+lo0);
-    \\    float ip_p = (Bxuh_p + Cxlo_p) * 0.5f;
-    \\    float v_p = fabs(b1pc-ip_p) + fabs(b1nc-ip_p);
-    \\    float Bxuh_m = odd ? hp1p[x+lo0] : R(r1p,x+lo0);
-    \\    float Cxlo_m = odd ? hp1n[x+uh]  : R(r1n,x+uh);
-    \\    float ip_m = (Bxuh_m + Cxlo_m) * 0.5f;
-    \\    float v_m = fabs(b1pc-ip_m) + fabs(b1nc-ip_m);
-    \\    return (float2)(alpha3*(s0p+s1p+s2p) + beta255*(float)abs(u)*0.5f + one_minus_ab*v_p,
-    \\                    alpha3*(s0m+s1m+s2m) + beta255*(float)abs(u)*0.5f + one_minus_ab*v_m);
     \\}
     \\
     \\// Strip-batched exactly like `interp` (see its header comment); TPH directions, 5-way
@@ -422,7 +592,9 @@ const kernel_src =
     \\                      const int mdis, const int nrad,
     \\                      const float alpha3, const float beta255, const float gamma255,
     \\                      const float one_minus_ab,
-    \\                      global const float * restrict hpsrcpad) {
+    \\                      global const float * restrict hpsrcpad,
+    \\                      global io_t * restrict dst2, const int dual,
+    \\                      const int doff, const int moff) {
     \\    const int off = get_global_id(1);
     \\    const int tid = get_local_id(0);
     \\    const int lsz = get_local_size(0);
@@ -450,32 +622,36 @@ const kernel_src =
     \\    const float g1 = gamma255*0.5f, g2 = gamma255;
     \\    for (int x0 = 1; x0 < w; x0 += BX) {
     \\        const int bn = min(BX, w - x0);
-    \\        // PARITY-SPLIT fill in (+u,-u) PAIR units: pairs form within a parity (u and
-    \\        // -u share it), so `odd` stays provably constant per pass (the old parity
-    \\        // split's warp-uniformity win) AND both costs of a pair share their 20 loads
-    \\        // per k (conn_cost_hp_pair — the fill is the LSU-bound bulk of this kernel).
+    \\        // PARITY-SPLIT fill in (pair, RUN-of-x) units: pairs form within a parity so
+    \\        // the parity-dependent row selection stays warp-uniform per pass (S*/Sel*
+    \\        // pointers picked at the call site), and each lane slides six register
+    \\        // h-windows across RUN consecutive x (cost_hp_pair_run — the LSU-bound bulk
+    \\        // of this kernel drops ~2.3-3x in loads, like the non-hp fill).
     \\        // Every (x,u) is still computed exactly once with the identical expressions.
     \\        #define NEVU (MDIS + 1)   /* even units: u=0 single + MDIS pairs (2j,-2j) */
     \\        #define NODU (MDIS)       /* odd units: MDIS pairs (2j+1,-(2j+1)) */
-    \\        for (int i = tid; i < bn*NEVU; i += lsz) {         // even directions
-    \\            const int dx = i / NEVU;
-    \\            const int j  = i - dx*NEVU;
+    \\        const int nrun = (bn + RUN_HP - 1) / RUN_HP;
+    \\        for (int i = tid; i < nrun*NEVU; i += lsz) {       // even directions (S = full rows)
+    \\            const int r = i / NEVU;
+    \\            const int j = i - r*NEVU;
+    \\            const int xs = x0 + r*RUN_HP;
+    \\            const int rl = min(RUN_HP, bn - r*RUN_HP);
+    \\            local float *co = cst + (r*RUN_HP)*TPH;
     \\            if (j == 0) {
-    \\                cst[dx*TPH + cen] = conn_cost_hp(r3p,r1p,r1n,r3n, hp3p,hp1p,hp1n,hp3n, x0+dx, 0, w, nrad, alpha3, beta255, one_minus_ab);
+    \\                for (int t = 0; t < rl; t++)    /* u=0: original conn_cost_hp, per x */
+    \\                    co[t*TPH + cen] = conn_cost_hp(r3p,r1p,r1n,r3n, hp3p,hp1p,hp1n,hp3n, xs+t, 0, w, nrad, alpha3, beta255, one_minus_ab);
     \\            } else {
-    \\                const int uu = 2*j;
-    \\                const float2 cc = conn_cost_hp_pair(r3p,r1p,r1n,r3n, hp3p,hp1p,hp1n,hp3n, x0+dx, uu, w, nrad, alpha3, beta255, one_minus_ab);
-    \\                cst[dx*TPH + (cen + uu)] = cc.x;
-    \\                cst[dx*TPH + (cen - uu)] = cc.y;
+    \\                cost_hp_pair_run(r3p,r1p,r1n,r3n, r3p,r1p,r1n,r3n, r1p,r1n,
+    \\                                 co, xs, rl, 2*j, alpha3, beta255, one_minus_ab);
     \\            }
     \\        }
-    \\        for (int i = tid; i < bn*NODU; i += lsz) {         // odd directions
-    \\            const int dx = i / NODU;
-    \\            const int j  = i - dx*NODU;
-    \\            const int uu = 2*j + 1;
-    \\            const float2 cc = conn_cost_hp_pair(r3p,r1p,r1n,r3n, hp3p,hp1p,hp1n,hp3n, x0+dx, uu, w, nrad, alpha3, beta255, one_minus_ab);
-    \\            cst[dx*TPH + (cen + uu)] = cc.x;
-    \\            cst[dx*TPH + (cen - uu)] = cc.y;
+    \\        for (int i = tid; i < nrun*NODU; i += lsz) {       // odd directions (S = hp rows)
+    \\            const int r = i / NODU;
+    \\            const int j = i - r*NODU;
+    \\            const int xs = x0 + r*RUN_HP;
+    \\            const int rl = min(RUN_HP, bn - r*RUN_HP);
+    \\            cost_hp_pair_run(r3p,r1p,r1n,r3n, hp3p,hp1p,hp1n,hp3n, hp1p,hp1n,
+    \\                             cst + (r*RUN_HP)*TPH, xs, rl, 2*j + 1, alpha3, beta255, one_minus_ab);
     \\        }
     \\        barrier(CLK_LOCAL_MEM_FENCE);
     \\        for (int dx = 0; dx < bn; dx++) {
@@ -500,17 +676,30 @@ const kernel_src =
     \\        }
     \\    }
     \\    barrier(CLK_GLOBAL_MEM_FENCE | CLK_LOCAL_MEM_FENCE);
-    \\    global int *dm = dmap + (long)off*stride;
-    \\    if (tid == 0) {
+    \\    global int *dm = dmap + moff + (long)off*stride;
+    \\    // LOCAL-STAGED serial backtrack (see interp): 4*BX*TPH bytes == sizeof(cst) exactly.
+    \\    {
+    \\        local char *stg = (local char *)cst;   // char, NOT uchar: bd deltas are SIGNED
     \\        int f = 0;
-    \\        dm[w-1] = 0;
-    \\        for (int bx = w-2; bx >= 0; bx--) {
-    \\            f += (int)pb[bx*TPH + (cen + f)];
-    \\            dm[bx] = f;
+    \\        if (tid == 0) dm[w-1] = 0;
+    \\        for (int xhi = w-2; xhi >= 0; xhi -= 4*BX) {
+    \\            const int xlo = max(xhi - 4*BX + 1, 0);
+    \\            const int nb = (xhi - xlo + 1) * TPH;
+    \\            for (int i = tid; i < nb; i += lsz)
+    \\                stg[i] = pb[xlo*TPH + i];
+    \\            barrier(CLK_LOCAL_MEM_FENCE);
+    \\            if (tid == 0) {
+    \\                for (int bx = xhi; bx >= xlo; bx--) {
+    \\                    f += (int)stg[(bx - xlo)*TPH + (cen + f)];
+    \\                    dm[bx] = f;
+    \\                }
+    \\            }
+    \\            barrier(CLK_LOCAL_MEM_FENCE);   // walk done before stg is overwritten
     \\        }
     \\    }
     \\    barrier(CLK_GLOBAL_MEM_FENCE | CLK_LOCAL_MEM_FENCE);
-    \\    global io_t *drow = dst + dst_y[off]*stride;
+    \\    global io_t *drow = dst + doff + dst_y[off]*stride;
+    \\    global io_t *drow2 = dst2 + doff + dst_y[off]*stride;   // dual=1: seed vcheck's out (see interp)
     \\    for (int x = tid; x < w; x += lsz) {
     \\        const int dir = dm[x];
     \\        float val;
@@ -534,6 +723,7 @@ const kernel_src =
     \\            }
     \\        }
     \\        STORE_IO(drow, x, val);
+    \\        if (dual) STORE_IO(drow2, x, val);
     \\    }
     \\}
     \\
@@ -555,11 +745,38 @@ const kernel_src =
     \\// io_t, so all reads go through LOAD_IO and both stores through STORE_IO. The ±2-row
     \\// feedback therefore sees the QUANTIZED previously-stored row for int/f16 io (like a
     \\// CPU int-domain implementation); for f32 io the macros are the identity (unchanged).
-    \\kernel void vcheck(global io_t *out, global const io_t *dst, global const io_t *src,
-    \\                   global const int *rowidx, global const int *dmap, global const io_t *scp,
-    \\                   const int w, const int stride, const int dst_h, const int field,
-    \\                   const int n_interp, const int vmode, const int use_scp, const int hp,
-    \\                   const float rcp0, const float rcp1, const float rcp2, const float vthresh2) {
+    \\// VC_WG (baked): the exact single-workgroup launch size. reqd_work_group_size is
+    \\// LOAD-BEARING under -cl-nv-maxrregcount=96: without it ptxas budgets registers for a
+    \\// possible 1024-thread launch ONLY up to the 64-reg default — raising the cap to 96 let
+    \\// this kernel exceed 64 regs (f16 io hit 70) and the 1024-thread enqueue then failed
+    \\// with CL_INVALID_WORK_GROUP_SIZE. The hard reqd restores the exact-size budget.
+    \\// FUSED PLANE BATCH (round 4): the per-plane vcheck chains are mutually independent —
+    \\// the only reason they serialized was the shared in-order queue. With every io buffer
+    \\// holding per-plane REGIONS (element offsets in `geom`), ONE launch of nplanes
+    \\// workgroups runs the chains CONCURRENTLY (group_id = plane; each WG executes the
+    \\// original single-plane body verbatim over its own disjoint regions, barrier() is
+    \\// WG-local). YUV ns1 makespan drops from sum(0.75+0.4+0.4) to max(~0.78) ms; a Gray
+    \\// launch (nplanes=1) degenerates to exactly the old single-WG schedule.
+    \\// geom[p*6+..] = {w, stride, dst_h, off_io, off_src, off_dmap}; n_interp is derived
+    \\// in-kernel with process()'s exact formula (dst_h - field + 1)/2.
+    \\__attribute__((reqd_work_group_size(VC_WG, 1, 1)))
+    \\kernel void vcheck(global io_t *out_b, global const io_t *dst_b, global const io_t *src_b,
+    \\                   global const int *rowidx0, global const int *rowidx1, global const int *rowidx2,
+    \\                   global const int *dmap_b, global const io_t *scp_b,
+    \\                   global const int *geom, const int field,
+    \\                   const int vmode, const int use_scp, const int hp,
+    \\                   const float rcp0, const float rcp1, const float rcp2, const float vthresh2,
+    \\                   const int nplanes) {
+    \\    const int p = get_group_id(0);
+    \\    if (p >= nplanes) return;
+    \\    const int w = geom[p*6+0], stride = geom[p*6+1], dst_h = geom[p*6+2];
+    \\    global io_t *out = out_b + geom[p*6+3];
+    \\    global const io_t *dst = dst_b + geom[p*6+3];
+    \\    global const io_t *src = src_b + geom[p*6+4];
+    \\    global const int *dmap = dmap_b + geom[p*6+5];
+    \\    global const io_t *scp = scp_b + geom[p*6+3];
+    \\    global const int *rowidx = (p == 0) ? rowidx0 : ((p == 1) ? rowidx1 : rowidx2);
+    \\    const int n_interp = (dst_h - field + 1) / 2;
     \\    const int lid = get_local_id(0);
     \\    const int lsz = get_local_size(0);
     \\    for (int off = 1; off + 1 < n_interp; ++off) {
@@ -627,16 +844,17 @@ const kernel_src =
     \\// elements as bit patterns (avoids declaring `half` objects, which core CL forbids).
     \\kernel __attribute__((reqd_work_group_size(16, 16, 1)))
     \\void transpose(global raw_t *out, global const raw_t *in,
-    \\               const int in_w, const int in_h, const int in_stride, const int out_stride) {
+    \\               const int in_w, const int in_h, const int in_stride, const int out_stride,
+    \\               const int soff, const int doff) {
     \\    local raw_t tile[16][17];
     \\    const int lx = get_local_id(0), ly = get_local_id(1);
     \\    const int c0 = get_group_id(0) * 16, r0 = get_group_id(1) * 16;
     \\    const int c = c0 + lx, r = r0 + ly;
-    \\    if (c < in_w && r < in_h) tile[ly][lx] = in[r*in_stride + c];
+    \\    if (c < in_w && r < in_h) tile[ly][lx] = in[soff + r*in_stride + c];
     \\    barrier(CLK_LOCAL_MEM_FENCE);
     \\    // write transposed: lane lx walks r (coalesced along out rows)
     \\    const int oc = c0 + ly, orr = r0 + lx;
-    \\    if (oc < in_w && orr < in_h) out[oc*out_stride + orr] = tile[lx][ly];
+    \\    if (oc < in_w && orr < in_h) out[doff + oc*out_stride + orr] = tile[lx][ly];
     \\}
     \\
 ;
@@ -683,12 +901,22 @@ const Data = struct {
     configs: [max_cfg]Config = undefined,
     n_cfg: usize = 0,
     plane_cfg: [3]usize = .{ 0, 0, 0 },
+
+    off_io: [3]u32 = .{ 0, 0, 0 },
+    off_src: [3]u32 = .{ 0, 0, 0 },
+    off_dmap: [3]u32 = .{ 0, 0, 0 },
+    sum_io: usize = 0,
+    sum_src: usize = 0,
+    sum_dmap: usize = 0,
+    vc_geom: [18]i32 = [_]i32{0} ** 18,
+
     rowidx_host: [max_cfg][2][]i32 = undefined,
     dsty_host: [max_cfg][2][]i32 = undefined,
 
     tpitch: u32 = 0,
     lws: usize = 0,
     max_wg: usize = 256,
+    is_nv: bool = false,
     pad: u32 = 0,
     platform: cl.Platform = undefined,
     device: cl.Device = undefined,
@@ -703,8 +931,9 @@ const Stream = struct {
     d_srcpad: cl.Buffer(f32),
     d_hpsrcpad: cl.Buffer(f32),
     d_dst: cl.Buffer(u8),
-    d_rowidx: cl.Buffer(i32),
-    d_dsty: cl.Buffer(i32),
+    d_rowidx: [max_cfg][2]cl.Buffer(i32),
+    d_dsty: [max_cfg][2]cl.Buffer(i32),
+    d_vcgeom: cl.Buffer(i32),
     d_pbackt: cl.Buffer(i8),
     d_dmap: cl.Buffer(i32),
     d_dst2: cl.Buffer(u8),
@@ -720,13 +949,18 @@ const Stream = struct {
     k_vcheck: [max_cfg]cl.Kernel,
     k_transpose: cl.Kernel,
     n_kern_cfg: usize,
+    n_tbl_sets: usize,
 
     pub fn init(self: *Stream, d: *Data) !void {
         self.n_kern_cfg = 0;
+        self.n_tbl_sets = 0;
         self.program = try cl.createProgramWithSource(d.context, kernel_src);
         errdefer self.program.release();
-        const bx: u32 = if (d.hp) 16 else 32;
-        const build_opts = try std.fmt.allocPrintSentinel(allocator, "-cl-std=CL1.2 -DCN={d} -DMDIS={d} -DBX={d} -DBITS={d} -DHALF={d}", .{ d.nrad, d.mdis, bx, d.bits, @intFromBool(d.half) }, 0);
+
+        const bx: u32 = 48;
+        const nv_opt: []const u8 = if (d.is_nv) " -cl-nv-maxrregcount=96" else "";
+        const vc_wg: usize = @min(@as(usize, 1024), d.max_wg);
+        const build_opts = try std.fmt.allocPrintSentinel(allocator, "-cl-std=CL1.2 -DCN={d} -DMDIS={d} -DBX={d} -DBITS={d} -DHALF={d} -DVC_WG={d}{s}", .{ d.nrad, d.mdis, bx, d.bits, @intFromBool(d.half), vc_wg, nv_opt }, 0);
         defer allocator.free(build_opts);
         self.program.build(&.{d.device}, build_opts) catch |err| {
             if (err == error.BuildProgramFailure) {
@@ -738,38 +972,53 @@ const Stream = struct {
         };
         self.queue = try cl.createCommandQueue(d.context, d.device, .{});
         errdefer self.queue.release();
+
+        errdefer _ = cl.c.clFinish(self.queue.handle);
         const c0 = &d.configs[0];
         const bytes: usize = d.bytes;
-        self.d_src = try cl.createBuffer(u8, d.context, .{ .read_only = true }, @as(usize, c0.stride) * c0.src_h * bytes);
+        const use_reg = d.vcheck > 0;
+        const src_elems: usize = if (use_reg) d.sum_src else @as(usize, c0.stride) * c0.src_h;
+        const io_elems: usize = if (use_reg) d.sum_io else @as(usize, c0.stride) * c0.dst_h;
+        const dmap_elems: usize = if (use_reg) d.sum_dmap else @as(usize, c0.n_interp_max) * c0.stride;
+        self.d_src = try cl.createBuffer(u8, d.context, .{ .read_only = true }, src_elems * bytes);
         errdefer self.d_src.release();
         self.d_srcpad = try cl.createBuffer(f32, d.context, .{ .read_write = true }, c0.pstride * c0.src_h);
         errdefer self.d_srcpad.release();
         self.d_hpsrcpad = try cl.createBuffer(f32, d.context, .{ .read_write = true }, if (d.hp) c0.pstride * c0.src_h else 1);
         errdefer self.d_hpsrcpad.release();
-        self.d_dst = try cl.createBuffer(u8, d.context, .{ .read_write = true }, @as(usize, c0.stride) * c0.dst_h * bytes);
+        self.d_dst = try cl.createBuffer(u8, d.context, .{ .read_write = true }, io_elems * bytes);
         errdefer self.d_dst.release();
-        self.d_rowidx = try cl.createBuffer(i32, d.context, .{ .read_only = true }, c0.n_interp_max * 4);
-        errdefer self.d_rowidx.release();
-        self.d_dsty = try cl.createBuffer(i32, d.context, .{ .read_only = true }, c0.n_interp_max);
-        errdefer self.d_dsty.release();
         self.d_pbackt = try cl.createBuffer(i8, d.context, .{ .read_write = true }, @as(usize, c0.n_interp_max) * c0.w * d.tpitch);
         errdefer self.d_pbackt.release();
-        self.d_dmap = try cl.createBuffer(i32, d.context, .{ .read_write = true }, @as(usize, c0.n_interp_max) * c0.stride);
+        self.d_dmap = try cl.createBuffer(i32, d.context, .{ .read_write = true }, dmap_elems);
         errdefer self.d_dmap.release();
-        self.d_dst2 = try cl.createBuffer(u8, d.context, .{ .read_write = true }, if (d.vcheck > 0) @as(usize, c0.stride) * c0.dst_h * bytes else 1);
+        self.d_dst2 = try cl.createBuffer(u8, d.context, .{ .read_write = true }, if (d.vcheck > 0) io_elems * bytes else 1);
         errdefer self.d_dst2.release();
         self.d_inframe = try cl.createBuffer(u8, d.context, .{ .read_write = true }, if (d.horizontal) @as(usize, c0.in_stride) * c0.in_h * bytes else 1);
         errdefer self.d_inframe.release();
         self.d_outframe = try cl.createBuffer(u8, d.context, .{ .read_write = true }, if (d.horizontal) @as(usize, c0.out_stride) * c0.in_h * bytes else 1);
         errdefer self.d_outframe.release();
         const have_scp = d.sclip != null and d.vcheck > 0;
-        self.d_scp = try cl.createBuffer(u8, d.context, .{ .read_write = true }, if (have_scp) @as(usize, c0.stride) * c0.dst_h * bytes else 1);
+        self.d_scp = try cl.createBuffer(u8, d.context, .{ .read_write = true }, if (have_scp) io_elems * bytes else 1);
         errdefer self.d_scp.release();
         self.d_scpframe = try cl.createBuffer(u8, d.context, .{ .read_write = true }, if (have_scp and d.horizontal) @as(usize, c0.out_stride) * c0.in_h * bytes else 1);
         errdefer self.d_scpframe.release();
+        self.d_vcgeom = try cl.createBuffer(i32, d.context, .{ .read_only = true }, if (d.vcheck > 0) d.vc_geom.len else 1);
+        errdefer self.d_vcgeom.release();
+        if (d.vcheck > 0) try writeBuf(i32, self, self.d_vcgeom, &d.vc_geom);
 
         errdefer self.releaseKernels();
+        errdefer self.releaseTables();
         for (0..d.n_cfg) |ci| {
+            for (0..2) |fb| {
+                self.d_rowidx[ci][fb] = try cl.createBuffer(i32, d.context, .{ .read_only = true }, d.rowidx_host[ci][fb].len);
+                errdefer self.d_rowidx[ci][fb].release();
+                try writeBuf(i32, self, self.d_rowidx[ci][fb], d.rowidx_host[ci][fb]);
+                self.d_dsty[ci][fb] = try cl.createBuffer(i32, d.context, .{ .read_only = true }, d.dsty_host[ci][fb].len);
+                errdefer self.d_dsty[ci][fb].release();
+                try writeBuf(i32, self, self.d_dsty[ci][fb], d.dsty_host[ci][fb]);
+                self.n_tbl_sets = ci * 2 + fb + 1;
+            }
             self.k_copy[ci] = try cl.createKernel(self.program, "copy_kept");
             errdefer self.k_copy[ci].release();
             self.k_pad[ci] = try cl.createKernel(self.program, "pad_src");
@@ -801,6 +1050,15 @@ const Stream = struct {
         }
     }
 
+    fn releaseTables(self: *Stream) void {
+        var i: usize = self.n_tbl_sets;
+        while (i > 0) {
+            i -= 1;
+            self.d_dsty[i / 2][i % 2].release();
+            self.d_rowidx[i / 2][i % 2].release();
+        }
+    }
+
     fn setStaticArgs(self: *Stream, d: *Data, ci: usize) !void {
         const cfg = &d.configs[ci];
         const w: c_int = @intCast(cfg.w);
@@ -814,6 +1072,7 @@ const Stream = struct {
         try self.k_pad[ci].setArg(c_int, 4, @intCast(cfg.pstride));
         try self.k_pad[ci].setArg(c_int, 5, @intCast(d.pad));
         try self.k_pad[ci].setArg(c_int, 6, src_h_i);
+        try self.k_pad[ci].setArg(c_int, 7, 0);
 
         if (d.hp) {
             try self.k_pad_hp[ci].setArg(@TypeOf(self.d_hpsrcpad), 0, self.d_hpsrcpad);
@@ -832,11 +1091,18 @@ const Stream = struct {
         try self.k_copy[ci].setArg(c_int, 6, src_h_i);
         try self.k_copy[ci].setArg(c_int, 7, @intCast(cfg.dst_h));
 
+        const dual: c_int = @intFromBool(d.vcheck > 0);
+        try self.k_copy[ci].setArg(@TypeOf(self.d_dst2), 8, self.d_dst2);
+        try self.k_copy[ci].setArg(c_int, 9, dual);
+        try self.k_copy[ci].setArg(c_int, 10, 0);
+        try self.k_copy[ci].setArg(c_int, 11, 0);
+
         const ik = if (d.hp) self.k_interp_hp[ci] else self.k_interp[ci];
         try ik.setArg(@TypeOf(self.d_dst), 0, self.d_dst);
         try ik.setArg(@TypeOf(self.d_srcpad), 1, self.d_srcpad);
-        try ik.setArg(@TypeOf(self.d_rowidx), 2, self.d_rowidx);
-        try ik.setArg(@TypeOf(self.d_dsty), 3, self.d_dsty);
+
+        try ik.setArg(@TypeOf(self.d_rowidx[ci][0]), 2, self.d_rowidx[ci][0]);
+        try ik.setArg(@TypeOf(self.d_dsty[ci][0]), 3, self.d_dsty[ci][0]);
         try ik.setArg(@TypeOf(self.d_pbackt), 4, self.d_pbackt);
         try ik.setArg(@TypeOf(self.d_dmap), 5, self.d_dmap);
         try ik.setArg(c_int, 6, w);
@@ -849,34 +1115,49 @@ const Stream = struct {
         try ik.setArg(f32, 13, d.beta);
         try ik.setArg(f32, 14, d.gamma);
         try ik.setArg(f32, 15, d.one_minus_ab);
+
         if (d.hp) {
             try ik.setArg(@TypeOf(self.d_hpsrcpad), 16, self.d_hpsrcpad);
+            try ik.setArg(@TypeOf(self.d_dst2), 17, self.d_dst2);
+            try ik.setArg(c_int, 18, dual);
+            try ik.setArg(c_int, 19, 0);
+            try ik.setArg(c_int, 20, 0);
+        } else {
+            try ik.setArg(@TypeOf(self.d_dst2), 16, self.d_dst2);
+            try ik.setArg(c_int, 17, dual);
+            try ik.setArg(c_int, 18, 0);
+            try ik.setArg(c_int, 19, 0);
         }
 
-        if (d.vcheck > 0) {
+        if (d.vcheck > 0 and ci == 0) {
             const use_scp: c_int = if (d.sclip != null) 1 else 0;
-            try self.k_vcheck[ci].setArg(@TypeOf(self.d_dst2), 0, self.d_dst2);
-            try self.k_vcheck[ci].setArg(@TypeOf(self.d_dst), 1, self.d_dst);
-            try self.k_vcheck[ci].setArg(@TypeOf(self.d_src), 2, self.d_src);
-            try self.k_vcheck[ci].setArg(@TypeOf(self.d_rowidx), 3, self.d_rowidx);
-            try self.k_vcheck[ci].setArg(@TypeOf(self.d_dmap), 4, self.d_dmap);
-            try self.k_vcheck[ci].setArg(@TypeOf(self.d_scp), 5, self.d_scp);
-            try self.k_vcheck[ci].setArg(c_int, 6, w);
-            try self.k_vcheck[ci].setArg(c_int, 7, stride);
-            try self.k_vcheck[ci].setArg(c_int, 8, @intCast(cfg.dst_h));
-            try self.k_vcheck[ci].setArg(c_int, 11, @intCast(d.vcheck));
-            try self.k_vcheck[ci].setArg(c_int, 12, use_scp);
-            try self.k_vcheck[ci].setArg(c_int, 13, @intFromBool(d.hp));
-            try self.k_vcheck[ci].setArg(f32, 14, d.rcp0);
-            try self.k_vcheck[ci].setArg(f32, 15, d.rcp1);
-            try self.k_vcheck[ci].setArg(f32, 16, d.rcp2);
-            try self.k_vcheck[ci].setArg(f32, 17, d.vthresh2);
+            const kv = self.k_vcheck[0];
+            try kv.setArg(@TypeOf(self.d_dst2), 0, self.d_dst2);
+            try kv.setArg(@TypeOf(self.d_dst), 1, self.d_dst);
+            try kv.setArg(@TypeOf(self.d_src), 2, self.d_src);
+            try kv.setArg(@TypeOf(self.d_rowidx[0][0]), 3, self.d_rowidx[0][0]);
+            try kv.setArg(@TypeOf(self.d_rowidx[0][0]), 4, self.d_rowidx[0][0]);
+            try kv.setArg(@TypeOf(self.d_rowidx[0][0]), 5, self.d_rowidx[0][0]);
+            try kv.setArg(@TypeOf(self.d_dmap), 6, self.d_dmap);
+            try kv.setArg(@TypeOf(self.d_scp), 7, self.d_scp);
+            try kv.setArg(@TypeOf(self.d_vcgeom), 8, self.d_vcgeom);
+            try kv.setArg(c_int, 10, @intCast(d.vcheck));
+            try kv.setArg(c_int, 11, use_scp);
+            try kv.setArg(c_int, 12, @intFromBool(d.hp));
+            try kv.setArg(f32, 13, d.rcp0);
+            try kv.setArg(f32, 14, d.rcp1);
+            try kv.setArg(f32, 15, d.rcp2);
+            try kv.setArg(f32, 16, d.vthresh2);
+            try kv.setArg(c_int, 17, @intCast(d.vi.format.numPlanes));
         }
     }
 
     pub fn deinit(self: *Stream) void {
+        _ = cl.c.clFinish(self.queue.handle);
         self.k_transpose.release();
         self.releaseKernels();
+        self.releaseTables();
+        self.d_vcgeom.release();
         self.d_scpframe.release();
         self.d_scp.release();
         self.d_outframe.release();
@@ -884,8 +1165,6 @@ const Stream = struct {
         self.d_dst2.release();
         self.d_dmap.release();
         self.d_pbackt.release();
-        self.d_dsty.release();
-        self.d_rowidx.release();
         self.d_dst.release();
         self.d_hpsrcpad.release();
         self.d_srcpad.release();
@@ -915,6 +1194,12 @@ fn initOpenCL(d: *Data, device_id: usize) !void {
     if (cl.c.clGetDeviceInfo(d.device.id, cl.c.CL_DEVICE_MAX_WORK_GROUP_SIZE, @sizeOf(usize), &dev_max_wg, null) == cl.c.CL_SUCCESS and dev_max_wg > 0) {
         d.max_wg = dev_max_wg;
     }
+
+    var vend: [256]u8 = undefined;
+    var vlen: usize = 0;
+    if (cl.c.clGetDeviceInfo(d.device.id, cl.c.CL_DEVICE_VENDOR, vend.len, &vend, &vlen) == cl.c.CL_SUCCESS and vlen > 0) {
+        d.is_nv = std.mem.indexOf(u8, vend[0..vlen], "NVIDIA") != null;
+    }
 }
 
 const ndr = vszipcl.ndr;
@@ -925,19 +1210,37 @@ fn readBuf(comptime T: type, s: *Stream, buf: cl.Buffer(T), dst: []T) !void {
     return vszipcl.enqRead(s.queue, buf.handle, 0, std.mem.sliceAsBytes(dst));
 }
 
-fn process(d: *Data, s: *Stream, ci: usize, dstp: []u8, srcp: []const u8, scpp: ?[]const u8, field: u8, sync: bool) !void {
+fn processPlane(d: *Data, s: *Stream, ci: usize, plane: usize, srcp: []const u8, scpp: ?[]const u8, field: u8) !void {
     const cfg = &d.configs[ci];
     const n_interp: u32 = (cfg.dst_h - field + 1) / 2;
     errdefer _ = cl.c.clFinish(s.queue.handle);
 
-    try writeBuf(i32, s, s.d_rowidx, d.rowidx_host[ci][field & 1]);
-    try writeBuf(i32, s, s.d_dsty, d.dsty_host[ci][field & 1]);
+    const use_reg = d.vcheck > 0;
+    const off_io: c_int = if (use_reg) @intCast(d.off_io[plane]) else 0;
+    const off_src: c_int = if (use_reg) @intCast(d.off_src[plane]) else 0;
+    const off_dm: c_int = if (use_reg) @intCast(d.off_dmap[plane]) else 0;
+
+    const fb: usize = field & 1;
+    const ik = if (d.hp) s.k_interp_hp[ci] else s.k_interp[ci];
+    try ik.setArg(@TypeOf(s.d_rowidx[ci][fb]), 2, s.d_rowidx[ci][fb]);
+    try ik.setArg(@TypeOf(s.d_dsty[ci][fb]), 3, s.d_dsty[ci][fb]);
+
+    if (d.hp) {
+        try ik.setArg(c_int, 19, off_io);
+        try ik.setArg(c_int, 20, off_dm);
+    } else {
+        try ik.setArg(c_int, 18, off_io);
+        try ik.setArg(c_int, 19, off_dm);
+    }
+    try s.k_pad[ci].setArg(c_int, 7, off_src);
+    try s.k_copy[ci].setArg(c_int, 10, off_src);
+    try s.k_copy[ci].setArg(c_int, 11, off_io);
 
     if (d.horizontal) {
         try writeBuf(u8, s, s.d_inframe, srcp);
-        try runTranspose(s, s.d_src, s.d_inframe, cfg.in_w, cfg.in_h, cfg.in_stride, cfg.stride);
+        try runTranspose(s, s.d_src, s.d_inframe, cfg.in_w, cfg.in_h, cfg.in_stride, cfg.stride, 0, off_src);
     } else {
-        try writeBuf(u8, s, s.d_src, srcp);
+        try vszipcl.enqWrite(s.queue, s.d_src.handle, @as(usize, @intCast(off_src)) * d.bytes, srcp);
     }
 
     const pad_gws: [2]usize = .{ vsh.ceilN(@as(usize, d.pad) * 2 + cfg.w, 16), vsh.ceilN(@as(usize, cfg.src_h), 8) };
@@ -950,54 +1253,65 @@ fn process(d: *Data, s: *Stream, ci: usize, dstp: []u8, srcp: []const u8, scpp: 
     const copy_lws: [2]usize = .{ 16, 8 };
     try ndr(s, s.k_copy[ci], &copy_gws, &copy_lws);
 
-    const ik = if (d.hp) s.k_interp_hp[ci] else s.k_interp[ci];
     const interp_gws: [2]usize = .{ d.lws, n_interp };
     const interp_lws: [2]usize = .{ d.lws, 1 };
     try ndr(s, ik, &interp_gws, &interp_lws);
 
-    var result = s.d_dst;
     if (d.vcheck > 0) {
         if (scpp) |sp| {
             if (d.horizontal) {
                 try writeBuf(u8, s, s.d_scpframe, sp);
-                try runTranspose(s, s.d_scp, s.d_scpframe, cfg.out_w, cfg.in_h, cfg.out_stride, cfg.stride);
+                try runTranspose(s, s.d_scp, s.d_scpframe, cfg.out_w, cfg.in_h, cfg.out_stride, cfg.stride, 0, off_io);
             } else {
-                try writeBuf(u8, s, s.d_scp, sp);
+                try vszipcl.enqWrite(s.queue, s.d_scp.handle, @as(usize, @intCast(off_io)) * d.bytes, sp);
             }
         }
-
-        if (cl.c.clEnqueueCopyBuffer(s.queue.handle, s.d_dst.handle, s.d_dst2.handle, 0, 0, @as(usize, cfg.stride) * cfg.dst_h * d.bytes, 0, null, null) != cl.c.CL_SUCCESS) {
-            return error.EnqueueCopyBuffer;
-        }
-
-        try s.k_vcheck[ci].setArg(c_int, 9, field);
-        try s.k_vcheck[ci].setArg(c_int, 10, @intCast(n_interp));
-
-        const vc_wg: usize = @min(@as(usize, 1024), d.max_wg);
-        const vc_gws: [1]usize = .{vc_wg};
-        const vc_lws: [1]usize = .{vc_wg};
-        try ndr(s, s.k_vcheck[ci], &vc_gws, &vc_lws);
-        result = s.d_dst2;
     }
+}
 
+fn vcheckFused(d: *Data, s: *Stream, field: u8) !void {
+    errdefer _ = cl.c.clFinish(s.queue.handle);
+    const fb: usize = field & 1;
+    const np: usize = @intCast(d.vi.format.numPlanes);
+    const kv = s.k_vcheck[0];
+    for (0..3) |p| {
+        const ci = d.plane_cfg[if (p < np) p else 0];
+        try kv.setArg(@TypeOf(s.d_rowidx[ci][fb]), @intCast(3 + p), s.d_rowidx[ci][fb]);
+    }
+    try kv.setArg(c_int, 9, field);
+
+    const vc_wg: usize = @min(@as(usize, 1024), d.max_wg);
+    const vc_gws: [1]usize = .{vc_wg * np};
+    const vc_lws: [1]usize = .{vc_wg};
+    try ndr(s, kv, &vc_gws, &vc_lws);
+}
+
+fn downloadPlane(d: *Data, s: *Stream, ci: usize, plane: usize, dstp: []u8, sync: bool) !void {
+    const cfg = &d.configs[ci];
+    errdefer _ = cl.c.clFinish(s.queue.handle);
+    const use_reg = d.vcheck > 0;
+    const off_io: usize = if (use_reg) d.off_io[plane] else 0;
+    const result = if (d.vcheck > 0) s.d_dst2 else s.d_dst;
     if (d.horizontal) {
-        try runTranspose(s, s.d_outframe, result, cfg.w, cfg.dst_h, cfg.stride, cfg.out_stride);
+        try runTranspose(s, s.d_outframe, result, cfg.w, cfg.dst_h, cfg.stride, cfg.out_stride, @intCast(off_io), 0);
         try readBuf(u8, s, s.d_outframe, dstp);
     } else {
-        try readBuf(u8, s, result, dstp);
+        try vszipcl.enqRead(s.queue, result.handle, off_io * d.bytes, dstp);
     }
     if (sync) {
         if (cl.c.clFinish(s.queue.handle) != cl.c.CL_SUCCESS) return error.Finish;
     }
 }
 
-fn runTranspose(s: *Stream, dst: cl.Buffer(u8), src: cl.Buffer(u8), in_w: u32, in_h: u32, in_stride: u32, out_stride: u32) !void {
+fn runTranspose(s: *Stream, dst: cl.Buffer(u8), src: cl.Buffer(u8), in_w: u32, in_h: u32, in_stride: u32, out_stride: u32, soff: c_int, doff: c_int) !void {
     try s.k_transpose.setArg(@TypeOf(dst), 0, dst);
     try s.k_transpose.setArg(@TypeOf(src), 1, src);
     try s.k_transpose.setArg(c_int, 2, @intCast(in_w));
     try s.k_transpose.setArg(c_int, 3, @intCast(in_h));
     try s.k_transpose.setArg(c_int, 4, @intCast(in_stride));
     try s.k_transpose.setArg(c_int, 5, @intCast(out_stride));
+    try s.k_transpose.setArg(c_int, 6, soff);
+    try s.k_transpose.setArg(c_int, 7, doff);
     const gws: [2]usize = .{ vsh.ceilN(@as(usize, in_w), 16), vsh.ceilN(@as(usize, in_h), 16) };
     const lws: [2]usize = .{ 16, 16 };
     try ndr(s, s.k_transpose, &gws, &lws);
@@ -1030,20 +1344,48 @@ fn getFrame(n: c_int, ar: vs.ActivationReason, instance_data: ?*anyopaque, _: ?*
         const s = d.pool.acquire();
         defer d.pool.release(s);
 
+        const nplanes: u32 = @intCast(d.vi.format.numPlanes);
+        var failed = false;
         var plane: u32 = 0;
-        while (plane < d.vi.format.numPlanes) : (plane += 1) {
+        while (plane < nplanes and !failed) : (plane += 1) {
             const ci = d.plane_cfg[plane];
             const srcp = src.getReadSlice(plane);
-            const dstp = dst.getWriteSlice(plane);
             const scpp: ?[]const u8 = if (scp) |sc| sc.getReadSlice(plane) else null;
             std.debug.assert(src.getStride2(u8, plane) ==
                 (if (d.horizontal) d.configs[ci].in_stride else d.configs[ci].stride) * d.bytes);
-            process(d, s, ci, dstp, srcp, scpp, field, plane == d.vi.format.numPlanes - 1) catch |err| {
-                zapi.setFilterError("EEDI3: process failed.");
+            processPlane(d, s, ci, plane, srcp, scpp, field) catch |err| {
                 std.log.err("EEDI3 process failed: {}", .{err});
-                dst.deinit();
-                return null;
+                failed = true;
+                break;
             };
+            if (d.vcheck == 0) {
+                downloadPlane(d, s, ci, plane, dst.getWriteSlice(plane), plane == nplanes - 1) catch |err| {
+                    std.log.err("EEDI3 process failed: {}", .{err});
+                    failed = true;
+                };
+            }
+        }
+        if (!failed and d.vcheck > 0) {
+            blk: {
+                vcheckFused(d, s, field) catch |err| {
+                    std.log.err("EEDI3 process failed: {}", .{err});
+                    failed = true;
+                    break :blk;
+                };
+                plane = 0;
+                while (plane < nplanes) : (plane += 1) {
+                    downloadPlane(d, s, d.plane_cfg[plane], plane, dst.getWriteSlice(plane), plane == nplanes - 1) catch |err| {
+                        std.log.err("EEDI3 process failed: {}", .{err});
+                        failed = true;
+                        break;
+                    };
+                }
+            }
+        }
+        if (failed) {
+            zapi.setFilterError("EEDI3: process failed.");
+            dst.deinit();
+            return null;
         }
 
         dst_props.setFieldBased(.PROGRESSIVE);
@@ -1204,7 +1546,9 @@ fn createImpl(in: ?*const vs.Map, out: ?*vs.Map, _: ?*anyopaque, core_ptr: ?*vs.
                 cfg.dst_h = cfg.out_w;
                 cfg.in_stride = strides_in[cat];
                 cfg.out_stride = strides_out[cat];
-                cfg.stride = strides_out[cat];
+
+                const n_align: u32 = @divExact(vszipcl.vsFrameAlignment(), @as(u32, @intCast(d.vi.format.bytesPerSample)));
+                cfg.stride = @max(strides_out[cat], @as(u32, @intCast(vsh.ceilN(@as(usize, cfg.w), n_align))));
             } else {
                 cfg.w = @as(u32, @intCast(vi_in.width)) >> sw;
                 cfg.src_h = @as(u32, @intCast(vi_in.height)) >> sh;
@@ -1225,9 +1569,47 @@ fn createImpl(in: ?*const vs.Map, out: ?*vs.Map, _: ?*anyopaque, core_ptr: ?*vs.
         }
     }
 
-    if (@as(usize, d.configs[0].stride) * d.configs[0].dst_h >= (1 << 31)) {
-        map_out.setError("EEDI3: frame too large (a plane exceeds 2^31 samples).");
-        return;
+    {
+        var acc_io: u64 = 0;
+        var acc_src: u64 = 0;
+        var acc_dm: u64 = 0;
+        const nplanes: usize = @intCast(d.vi.format.numPlanes);
+        for (0..nplanes) |p| {
+            const cfg = &d.configs[d.plane_cfg[p]];
+            acc_io += @as(u64, cfg.stride) * cfg.dst_h;
+            acc_src += @as(u64, cfg.stride) * cfg.src_h;
+            acc_dm += @as(u64, cfg.n_interp_max) * cfg.stride;
+        }
+
+        const plane0: u64 = @as(u64, d.configs[0].stride) * d.configs[0].dst_h;
+        const max_extent = @max(plane0, if (vcheck > 0) @max(acc_io, @max(acc_src, acc_dm)) else 0);
+        if (max_extent >= (1 << 31)) {
+            map_out.setError("EEDI3: frame too large (a plane exceeds 2^31 samples).");
+            return;
+        }
+        if (vcheck > 0) {
+            var io: u64 = 0;
+            var sr: u64 = 0;
+            var dm: u64 = 0;
+            for (0..nplanes) |p| {
+                const cfg = &d.configs[d.plane_cfg[p]];
+                d.off_io[p] = @intCast(io);
+                d.off_src[p] = @intCast(sr);
+                d.off_dmap[p] = @intCast(dm);
+                d.vc_geom[p * 6 + 0] = @intCast(cfg.w);
+                d.vc_geom[p * 6 + 1] = @intCast(cfg.stride);
+                d.vc_geom[p * 6 + 2] = @intCast(cfg.dst_h);
+                d.vc_geom[p * 6 + 3] = @intCast(io);
+                d.vc_geom[p * 6 + 4] = @intCast(sr);
+                d.vc_geom[p * 6 + 5] = @intCast(dm);
+                io += @as(u64, cfg.stride) * cfg.dst_h;
+                sr += @as(u64, cfg.stride) * cfg.src_h;
+                dm += @as(u64, cfg.n_interp_max) * cfg.stride;
+            }
+        }
+        d.sum_io = @intCast(acc_io);
+        d.sum_src = @intCast(acc_src);
+        d.sum_dmap = @intCast(acc_dm);
     }
 
     for (0..d.n_cfg) |ci| {
