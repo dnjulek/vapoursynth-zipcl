@@ -726,7 +726,7 @@ const Stream = struct {
         self.program = try cl.createProgramWithSource(d.context, kernel_src);
         errdefer self.program.release();
         const bx: u32 = if (d.hp) 16 else 32;
-        const build_opts = try std.fmt.allocPrintSentinel(allocator, "-cl-std=CL3.0 -DCN={d} -DMDIS={d} -DBX={d} -DBITS={d} -DHALF={d}", .{ d.nrad, d.mdis, bx, d.bits, @intFromBool(d.half) }, 0);
+        const build_opts = try std.fmt.allocPrintSentinel(allocator, "-cl-std=CL1.2 -DCN={d} -DMDIS={d} -DBX={d} -DBITS={d} -DHALF={d}", .{ d.nrad, d.mdis, bx, d.bits, @intFromBool(d.half) }, 0);
         defer allocator.free(build_opts);
         self.program.build(&.{d.device}, build_opts) catch |err| {
             if (err == error.BuildProgramFailure) {

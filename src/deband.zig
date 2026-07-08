@@ -191,7 +191,7 @@ const Stream = struct {
         self.dlut = null;
         self.program = try cl.createProgramWithSource(d.context, deband_src);
         errdefer self.program.release();
-        const opts = try std.fmt.allocPrintSentinel(allocator, "-cl-std=CL3.0 -DITER={d} -DGRAIN_ON={d} -DBITS={d} -DHALF={d} -DDITHERK={d} -DDMODE={d}", .{ d.iterations, @intFromBool(d.grain_on), d.bits, @intFromBool(d.half), @intFromBool(d.dither_on), d.dmode }, 0);
+        const opts = try std.fmt.allocPrintSentinel(allocator, "-cl-std=CL1.2 -DITER={d} -DGRAIN_ON={d} -DBITS={d} -DHALF={d} -DDITHERK={d} -DDMODE={d}", .{ d.iterations, @intFromBool(d.grain_on), d.bits, @intFromBool(d.half), @intFromBool(d.dither_on), d.dmode }, 0);
         defer allocator.free(opts);
         self.program.build(&.{d.device}, opts) catch |err| {
             if (err == error.BuildProgramFailure) {

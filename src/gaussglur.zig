@@ -82,7 +82,7 @@ const Stream = struct {
         const idx_t: []const u8 = if (d.buff_elems < (1 << 31)) "int" else "long";
         if (d.any_large) {
             const opts = try std.fmt.allocPrintSentinel(allocator,
-                \\-cl-std=CL3.0 -DBX={d} -DBY={d} -DR={d} -DIDX={s} -DBITS={d} -DHALF={d}
+                \\-cl-std=CL1.2 -DBX={d} -DBY={d} -DR={d} -DIDX={s} -DBITS={d} -DHALF={d}
             , .{ large_blk_x, large_blk_y, large_r, idx_t, d.bits, @intFromBool(d.half) }, 0);
             defer allocator.free(opts);
             self.large_prog = try buildProgram(d, io_src ++ vertical_blur_src ++ horizontal_blur_src, opts);
@@ -101,7 +101,7 @@ const Stream = struct {
             switch (cfg.mode) {
                 .small => {
                     const opts = try std.fmt.allocPrintSentinel(allocator,
-                        \\-cl-std=CL3.0 -DW={d} -DH={d} -DSTRIDE={d} -DKLEN={d} -DRAD={d} -DBLK_X=16 -DBLK_Y=8 -DVRT=3 -DIDX={s} -DBITS={d} -DHALF={d}
+                        \\-cl-std=CL1.2 -DW={d} -DH={d} -DSTRIDE={d} -DKLEN={d} -DRAD={d} -DBLK_X=16 -DBLK_Y=8 -DVRT=3 -DIDX={s} -DBITS={d} -DHALF={d}
                     , .{ cfg.key.w, cfg.key.h, cfg.key.stride, cfg.ksize, cfg.radius, idx_t, d.bits, @intFromBool(d.half) }, 0);
                     defer allocator.free(opts);
                     const prog = try buildProgram(d, io_src ++ gauss_blur_src, opts);

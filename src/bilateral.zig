@@ -73,7 +73,7 @@ const Stream = struct {
         self.has_raw = false;
         self.program = try cl.createProgramWithSource(d.context, kernel_src);
         errdefer self.program.release();
-        const opts = try std.fmt.allocPrintSentinel(allocator, "-cl-std=CL3.0 -DHAS_REF={d} -DBITS={d} -DHALF={d}", .{ @intFromBool(d.has_ref), d.bits, @intFromBool(d.half) }, 0);
+        const opts = try std.fmt.allocPrintSentinel(allocator, "-cl-std=CL1.2 -DHAS_REF={d} -DBITS={d} -DHALF={d}", .{ @intFromBool(d.has_ref), d.bits, @intFromBool(d.half) }, 0);
         defer allocator.free(opts);
         self.program.build(&.{d.device}, opts) catch |err| {
             if (err == error.BuildProgramFailure) {

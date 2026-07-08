@@ -370,7 +370,7 @@ const Stream = struct {
         );
         const idx_t: []const u8 = if (idx_max < (1 << 31)) "int" else "long";
         const opts = try std.fmt.allocPrintSentinel(allocator,
-            \\-cl-std=CL3.0 -DVI_DIM_X={d} -DVI_DIM_Y={d} -DSTRIDE={d} -DPSTRIDE={d} -DPAD={d} -DPH={d} -DNLM_S={d} -DNLM_D={d} -DNLM_REF={d} -DNLM_CHANNELS={d} -DWMODE={d} -DBLK_X=16 -DBLK_Y=8 -DVRT_RESULT=3 -DNLM_H={e}f -DNLM_WREF={e}f -DIDX={s} -DBITS={d} -DHALF={d}
+            \\-cl-std=CL1.2 -DVI_DIM_X={d} -DVI_DIM_Y={d} -DSTRIDE={d} -DPSTRIDE={d} -DPAD={d} -DPH={d} -DNLM_S={d} -DNLM_D={d} -DNLM_REF={d} -DNLM_CHANNELS={d} -DWMODE={d} -DBLK_X=16 -DBLK_Y=8 -DVRT_RESULT=3 -DNLM_H={e}f -DNLM_WREF={e}f -DIDX={s} -DBITS={d} -DHALF={d}
         , .{ d.w, d.h_, d.stride, d.pstride, d.pad, d.ph, d.s, d.d, d.ref, d.chans, d.wmode, d.h, d.wref, idx_t, d.bits, @intFromBool(d.half) }, 0);
         defer allocator.free(opts);
         self.program.build(&.{d.device}, opts) catch |err| {
