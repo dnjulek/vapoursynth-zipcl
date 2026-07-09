@@ -17,6 +17,7 @@ const large_blk_x: usize = 16;
 const large_blk_y: usize = 8;
 const large_r: usize = 8;
 
+const tune_len = 5;
 const Config = struct {
     key: Key,
     ksize: i32,
@@ -45,6 +46,10 @@ const Data = struct {
     n_cfg: usize,
     any_large: bool,
     buff_elems: usize,
+    blk_x: usize,
+    blk_y: usize,
+    vrt: usize,
+    large_r: usize,
     pool: clpool.Pool(Stream, Data),
 };
 
@@ -83,7 +88,7 @@ const Stream = struct {
         if (d.any_large) {
             const opts = try std.fmt.allocPrintSentinel(allocator,
                 \\-cl-std=CL1.2 -DBX={d} -DBY={d} -DR={d} -DIDX={s} -DBITS={d} -DHALF={d}
-            , .{ large_blk_x, large_blk_y, large_r, idx_t, d.bits, @intFromBool(d.half) }, 0);
+            , .{ d.blk_x, d.blk_y, d.large_r, idx_t, d.bits, @intFromBool(d.half) }, 0);
             defer allocator.free(opts);
             self.large_prog = try buildProgram(d, io_src ++ vertical_blur_src ++ horizontal_blur_src, opts);
         }
@@ -101,8 +106,8 @@ const Stream = struct {
             switch (cfg.mode) {
                 .small => {
                     const opts = try std.fmt.allocPrintSentinel(allocator,
-                        \\-cl-std=CL1.2 -DW={d} -DH={d} -DSTRIDE={d} -DKLEN={d} -DRAD={d} -DBLK_X=16 -DBLK_Y=8 -DVRT=3 -DIDX={s} -DBITS={d} -DHALF={d}
-                    , .{ cfg.key.w, cfg.key.h, cfg.key.stride, cfg.ksize, cfg.radius, idx_t, d.bits, @intFromBool(d.half) }, 0);
+                        \\-cl-std=CL1.2 -DW={d} -DH={d} -DSTRIDE={d} -DKLEN={d} -DRAD={d} -DBLK_X={d} -DBLK_Y={d} -DVRT={d} -DIDX={s} -DBITS={d} -DHALF={d}
+                    , .{ cfg.key.w, cfg.key.h, cfg.key.stride, cfg.ksize, cfg.radius, d.blk_x, d.blk_y, d.vrt, idx_t, d.bits, @intFromBool(d.half) }, 0);
                     defer allocator.free(opts);
                     const prog = try buildProgram(d, io_src ++ gauss_blur_src, opts);
                     cr.program = prog;
@@ -333,27 +338,30 @@ fn process(d: *Data, s: *Stream, src: ZFrame, dst: ZFrameW) !void {
 
         switch (cfg.mode) {
             .small => {
-                const BX: usize = 16;
-                const BY: usize = 8;
-                const VR: usize = 3;
+                const BX: usize = d.blk_x;
+                const BY: usize = d.blk_y;
+                const VR: usize = d.vrt;
                 const lws: [2]usize = .{ BX, BY };
                 const gws: [2]usize = .{
-                    vsh.ceilN(@as(usize, @intCast(cfg.key.w)), BX),
+                    vszipcl.ceilTo(@as(usize, @intCast(cfg.key.w)), BX),
                     ((@as(usize, @intCast(cfg.key.h)) + VR * BY - 1) / (VR * BY)) * BY,
                 };
                 try ndr(s, cr.k1, &gws, &lws);
             },
             .large => {
-                const lws: [2]usize = .{ large_blk_x, large_blk_y };
+                const bx = d.blk_x;
+                const by = d.blk_y;
+                const r_ = d.large_r;
+                const lws: [2]usize = .{ bx, by };
                 const w_: usize = @intCast(cfg.key.w);
                 const h_: usize = @intCast(cfg.key.h);
                 const gws_v: [2]usize = .{
-                    ((w_ + large_blk_x - 1) / large_blk_x) * large_blk_x,
-                    (((h_ + large_r - 1) / large_r + large_blk_y - 1) / large_blk_y) * large_blk_y,
+                    ((w_ + bx - 1) / bx) * bx,
+                    (((h_ + r_ - 1) / r_ + by - 1) / by) * by,
                 };
                 const gws_h: [2]usize = .{
-                    (((w_ + large_r - 1) / large_r + large_blk_x - 1) / large_blk_x) * large_blk_x,
-                    ((h_ + large_blk_y - 1) / large_blk_y) * large_blk_y,
+                    (((w_ + r_ - 1) / r_ + bx - 1) / bx) * bx,
+                    ((h_ + by - 1) / by) * by,
                 };
                 try ndr(s, cr.k1, &gws_v, &lws);
                 try ndr(s, cr.k2.?, &gws_h, &lws);
@@ -507,7 +515,7 @@ pub fn create(in: ?*const vs.Map, out: ?*vs.Map, _: ?*anyopaque, core: ?*vs.Core
                     .key = key,
                     .ksize = ksize,
                     .radius = radius,
-                    .mode = if (radius > large_path_radius_threshold) .large else .small,
+                    .mode = .small,
                     .weights = weights,
                 };
                 d.n_cfg += 1;
@@ -516,22 +524,57 @@ pub fn create(in: ?*const vs.Map, out: ?*vs.Map, _: ?*anyopaque, core: ?*vs.Core
         }
     }
 
-    d.buff_elems = 0;
-    d.any_large = false;
-    {
-        var ci: usize = 0;
-        while (ci < d.n_cfg) : (ci += 1) {
-            d.buff_elems = @max(d.buff_elems, d.configs[ci].extent());
-            if (d.configs[ci].mode == .large) d.any_large = true;
-        }
-        std.debug.assert(d.buff_elems > 0);
-    }
-
     vszipcl.initContext(&d, @intCast(device_id)) catch |err| {
         map_out.setError(if (err == error.InvalidDeviceID) "GaussBlur: invalid device ID." else "GaussBlur: OpenCL initialization failed.");
         std.log.err("GaussBlur OpenCL init failed: {}", .{err});
         return;
     };
+    d.blk_x = large_blk_x;
+    d.blk_y = large_blk_y;
+    d.vrt = 3;
+    d.large_r = large_r;
+    var thr: i32 = large_path_radius_threshold;
+    {
+        var terr: ?[:0]const u8 = null;
+        if (map_in.numElements("tune")) |n| {
+            if (n > tune_len) terr = "GaussBlur: tune expects at most 5 entries [blk_x, blk_y, vrt, large_r, threshold].";
+        }
+        if (vszipcl.tuneEntry(map_in, 0)) |v| {
+            if (v < 1 or v > 64) terr = "GaussBlur: tune[0] (blk_x) must be 1..64." else d.blk_x = @intCast(v);
+        }
+        if (vszipcl.tuneEntry(map_in, 1)) |v| {
+            if (v < 1 or v > 64) terr = "GaussBlur: tune[1] (blk_y) must be 1..64." else d.blk_y = @intCast(v);
+        }
+        if (vszipcl.tuneEntry(map_in, 2)) |v| {
+            if (v < 1 or v > 8) terr = "GaussBlur: tune[2] (vrt) must be 1..8." else d.vrt = @intCast(v);
+        }
+        if (vszipcl.tuneEntry(map_in, 3)) |v| {
+            if (v < 1 or v > 32) terr = "GaussBlur: tune[3] (large_r) must be 1..32." else d.large_r = @intCast(v);
+        }
+        if (vszipcl.tuneEntry(map_in, 4)) |v| {
+            if (v > 256) terr = "GaussBlur: tune[4] (threshold) must be 0..256 (0 = always large path)." else thr = @intCast(v);
+        }
+        if (d.blk_x * d.blk_y > vszipcl.deviceMaxWG(d.device)) terr = "GaussBlur: tune blk_x*blk_y exceeds the device max work-group size.";
+        if (terr) |msg| {
+            map_out.setError(msg);
+            d.context.release();
+            return;
+        }
+    }
+    d.buff_elems = 0;
+    d.any_large = false;
+    {
+        const local_mem = vszipcl.deviceLocalMemSize(d.device);
+        var ci: usize = 0;
+        while (ci < d.n_cfg) : (ci += 1) {
+            const cfg = &d.configs[ci];
+            const tile_bytes = d.vrt * d.blk_y * (d.blk_x + 2 * @as(usize, @intCast(cfg.radius))) * @sizeOf(f32);
+            cfg.mode = if (thr == 0 or cfg.radius > thr or tile_bytes > local_mem) .large else .small;
+            d.buff_elems = @max(d.buff_elems, cfg.extent());
+            if (cfg.mode == .large) d.any_large = true;
+        }
+        std.debug.assert(d.buff_elems > 0);
+    }
 
     d.pool = .{};
 

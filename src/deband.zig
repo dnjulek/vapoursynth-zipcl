@@ -12,6 +12,7 @@ const ZAPI = vapoursynth.ZAPI;
 const allocator = std.heap.c_allocator;
 
 const max_iterations: i32 = 32;
+const tune_len = 2;
 const dlut_sizeb = 6;
 const dlut_size = 1 << dlut_sizeb;
 const dlut_len = dlut_size * dlut_size;
@@ -173,6 +174,8 @@ const Data = struct {
     dither_on: bool,
     dmode: i32,
     dlut: ?[]f32,
+    blk_x: usize,
+    blk_y: usize,
 
     pool: clpool.Pool(Stream, Data),
 };
@@ -191,7 +194,12 @@ const Stream = struct {
         self.dlut = null;
         self.program = try cl.createProgramWithSource(d.context, deband_src);
         errdefer self.program.release();
-        const opts = try std.fmt.allocPrintSentinel(allocator, "-cl-std=CL1.2 -DITER={d} -DGRAIN_ON={d} -DBITS={d} -DHALF={d} -DDITHERK={d} -DDMODE={d}", .{ d.iterations, @intFromBool(d.grain_on), d.bits, @intFromBool(d.half), @intFromBool(d.dither_on), d.dmode }, 0);
+        var blk_buf: [48]u8 = undefined;
+        const blk_opt: []const u8 = if (d.blk_x != 16 or d.blk_y != 8)
+            std.fmt.bufPrint(&blk_buf, " -DDB_BX={d} -DDB_BY={d}", .{ d.blk_x, d.blk_y }) catch unreachable
+        else
+            "";
+        const opts = try std.fmt.allocPrintSentinel(allocator, "-cl-std=CL1.2 -DITER={d} -DGRAIN_ON={d} -DBITS={d} -DHALF={d} -DDITHERK={d} -DDMODE={d}{s}", .{ d.iterations, @intFromBool(d.grain_on), d.bits, @intFromBool(d.half), @intFromBool(d.dither_on), d.dmode, blk_opt }, 0);
         defer allocator.free(opts);
         self.program.build(&.{d.device}, opts) catch |err| {
             if (err == error.BuildProgramFailure) {
@@ -258,6 +266,13 @@ const Stream = struct {
 const deband_src =
     \\#define TWO_PI 6.283185f
     \\#define INV_U32 0x1p-32f
+    \\
+    \\#ifndef DB_BX
+    \\#define DB_BX 16
+    \\#endif
+    \\#ifndef DB_BY
+    \\#define DB_BY 8
+    \\#endif
     \\
     \\// LOADI/STOREI take (pointer, index) because the HALF path cannot dereference a half*
     \\// (cl_khr_fp16 is not exposed on NVIDIA; pointers + vload/vstore_half are core CL).
@@ -369,7 +384,7 @@ const deband_src =
     \\    return res;
     \\}
     \\
-    \\kernel __attribute__((reqd_work_group_size(16, 8, 1)))
+    \\kernel __attribute__((reqd_work_group_size(DB_BX, DB_BY, 1)))
     \\void deband(global io_t *dst, global const io_t *src,
     \\            int W, int H, int STRIDE,
     \\            float threshold, float radius, float grain, uint zseed) {
@@ -383,7 +398,7 @@ const deband_src =
     \\}
     \\
     \\#if DITHERK
-    \\kernel __attribute__((reqd_work_group_size(16, 8, 1)))
+    \\kernel __attribute__((reqd_work_group_size(DB_BX, DB_BY, 1)))
     \\void deband_d(global io_t *dst, global const io_t *src,
     \\              int W, int H, int STRIDE,
     \\              float threshold, float radius, float grain, uint zseed
@@ -459,8 +474,8 @@ fn process(d: *Data, s: *Stream, src: ZFrame, dst: ZFrameW, n: c_int) !void {
         const k = s.kernels[@intCast(d.rank[p])];
         try k.setArg(c_uint, 8, z);
 
-        const lws: [2]usize = .{ 16, 8 };
-        const gws: [2]usize = .{ vsh.ceilN(w, 16), vsh.ceilN(h, 8) };
+        const lws: [2]usize = .{ d.blk_x, d.blk_y };
+        const gws: [2]usize = .{ vszipcl.ceilTo(w, d.blk_x), vszipcl.ceilTo(h, d.blk_y) };
         try ndr(s, k, &gws, &lws);
 
         try readBuf(s, s.dst, dstp);
@@ -550,7 +565,6 @@ pub fn create(in: ?*const vs.Map, out: ?*vs.Map, _: ?*anyopaque, core: ?*vs.Core
             sel[ui] = true;
         }
     }
-
     const dither_req = map_in.getValue(i32, "dither");
     d.dither_on = (if (dither_req) |dv| dv != 0 else true) and bits == 8;
     const dither_algo = map_in.getValue(i32, "dither_algo") orelse 0;
@@ -615,6 +629,27 @@ pub fn create(in: ?*const vs.Map, out: ?*vs.Map, _: ?*anyopaque, core: ?*vs.Core
         return;
     };
 
+    d.blk_x = 16;
+    d.blk_y = 8;
+    {
+        var terr: ?[:0]const u8 = null;
+        if (map_in.numElements("tune")) |n| {
+            if (n > tune_len) terr = "Deband: tune expects at most 2 entries [blk_x, blk_y].";
+        }
+        if (vszipcl.tuneEntry(map_in, 0)) |v| {
+            if (v < 1 or v > 64) terr = "Deband: tune[0] (blk_x) must be 1..64." else d.blk_x = @intCast(v);
+        }
+        if (vszipcl.tuneEntry(map_in, 1)) |v| {
+            if (v < 1 or v > 64) terr = "Deband: tune[1] (blk_y) must be 1..64." else d.blk_y = @intCast(v);
+        }
+        if (d.blk_x * d.blk_y > vszipcl.deviceMaxWG(d.device)) terr = "Deband: tune blk_x*blk_y exceeds the device max work-group size.";
+        if (terr) |msg| {
+            map_out.setError(msg);
+            d.context.release();
+            if (d.dlut) |lut| allocator.free(lut);
+            return;
+        }
+    }
     d.pool = .{};
     const data: *Data = allocator.create(Data) catch unreachable;
     data.* = d;
@@ -636,6 +671,5 @@ pub fn create(in: ?*const vs.Map, out: ?*vs.Map, _: ?*anyopaque, core: ?*vs.Core
     var dep = [_]vs.FilterDependency{
         .{ .source = d.node, .requestPattern = .StrictSpatial },
     };
-
     zapi.createVideoFilter(out, "Deband", d.vi, getFrame, free, .Parallel, &dep, data);
 }

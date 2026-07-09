@@ -13,6 +13,7 @@ const allocator = std.heap.c_allocator;
 
 const FLT_EPSILON: f32 = 1.19209290e-7;
 
+const tune_len = 4;
 const Config = struct {
     radius: i32,
     w: i32,
@@ -36,6 +37,11 @@ const Data = struct {
     plane_cfg: [3]usize,
     has_ref: bool,
     use_shared_memory: bool,
+    blk_x: usize,
+    blk_y: usize,
+    smem_budget: usize,
+    use_pinned: bool,
+    conv_wg: usize,
     bits: i32,
     half: bool,
     bytes: u32,
@@ -63,7 +69,7 @@ const Stream = struct {
     dst: cl.Buffer(f32),
     raw: cl.Buffer(u8),
     has_raw: bool,
-    stage: cl.Buffer(u8),
+    stage: ?cl.Buffer(u8),
     host: []u8,
 
     pub fn init(self: *Stream, d: *Data) !void {
@@ -73,7 +79,17 @@ const Stream = struct {
         self.has_raw = false;
         self.program = try cl.createProgramWithSource(d.context, kernel_src);
         errdefer self.program.release();
-        const opts = try std.fmt.allocPrintSentinel(allocator, "-cl-std=CL1.2 -DHAS_REF={d} -DBITS={d} -DHALF={d}", .{ @intFromBool(d.has_ref), d.bits, @intFromBool(d.half) }, 0);
+        var blk_buf: [64]u8 = undefined;
+        const blk_opt: []const u8 = if (d.blk_x != 16 or d.blk_y != 8)
+            std.fmt.bufPrint(&blk_buf, " -DBLOCK_X={d} -DBLOCK_Y={d}", .{ d.blk_x, d.blk_y }) catch unreachable
+        else
+            "";
+        var cw_buf: [24]u8 = undefined;
+        const cw_opt: []const u8 = if (d.conv_wg != 256)
+            std.fmt.bufPrint(&cw_buf, " -DCONV_WG={d}", .{d.conv_wg}) catch unreachable
+        else
+            "";
+        const opts = try std.fmt.allocPrintSentinel(allocator, "-cl-std=CL1.2 -DHAS_REF={d} -DBITS={d} -DHALF={d}{s}{s}", .{ @intFromBool(d.has_ref), d.bits, @intFromBool(d.half), blk_opt, cw_opt }, 0);
         defer allocator.free(opts);
         self.program.build(&.{d.device}, opts) catch |err| {
             if (err == error.BuildProgramFailure) {
@@ -94,27 +110,33 @@ const Stream = struct {
             self.has_raw = true;
         }
         errdefer if (self.has_raw) self.raw.release();
-        self.stage = try cl.createBuffer(u8, d.context, .{ .alloc_host_ptr = true }, d.buff_stage * d.bytes);
-        errdefer self.stage.release();
-        var map_err: cl.c.cl_int = cl.c.CL_SUCCESS;
-        const map_ptr = cl.c.clEnqueueMapBuffer(
-            self.queue.handle,
-            self.stage.handle,
-            cl.c.CL_TRUE,
-            cl.c.CL_MAP_READ | cl.c.CL_MAP_WRITE,
-            0,
-            d.buff_stage * d.bytes,
-            0,
-            null,
-            null,
-            &map_err,
-        );
-        if (map_err != cl.c.CL_SUCCESS or map_ptr == null) return error.MapStaging;
-        self.host = @as([*]u8, @ptrCast(map_ptr.?))[0 .. d.buff_stage * d.bytes];
-        errdefer {
-            _ = cl.c.clEnqueueUnmapMemObject(self.queue.handle, self.stage.handle, map_ptr, 0, null, null);
-            _ = cl.c.clFinish(self.queue.handle);
+        self.stage = if (d.use_pinned)
+            try cl.createBuffer(u8, d.context, .{ .alloc_host_ptr = true }, d.buff_stage * d.bytes)
+        else
+            null;
+        if (self.stage == null) self.host = try allocator.alloc(u8, d.buff_stage * d.bytes);
+        errdefer if (self.stage) |st| st.release() else allocator.free(self.host);
+        if (self.stage) |st| {
+            var map_err: cl.c.cl_int = cl.c.CL_SUCCESS;
+            const map_ptr = cl.c.clEnqueueMapBuffer(
+                self.queue.handle,
+                st.handle,
+                cl.c.CL_TRUE,
+                cl.c.CL_MAP_READ | cl.c.CL_MAP_WRITE,
+                0,
+                d.buff_stage * d.bytes,
+                0,
+                null,
+                null,
+                &map_err,
+            );
+            if (map_err != cl.c.CL_SUCCESS or map_ptr == null) return error.MapStaging;
+            self.host = @as([*]u8, @ptrCast(map_ptr.?))[0 .. d.buff_stage * d.bytes];
         }
+        errdefer if (self.stage) |st| {
+            _ = cl.c.clEnqueueUnmapMemObject(self.queue.handle, st.handle, self.host.ptr, 0, null, null);
+            _ = cl.c.clFinish(self.queue.handle);
+        };
 
         errdefer self.releaseKernels();
         for (d.configs[0..d.n_cfg], 0..) |cfg, ci| {
@@ -131,7 +153,7 @@ const Stream = struct {
             try k.setArg(c_int, 7, cfg.radius);
             if (cfg.use_sm) {
                 const rr: usize = @intCast(cfg.radius);
-                const smem_bytes: usize = (1 + @as(usize, @intFromBool(d.has_ref))) * (2 * rr + 8) * (2 * rr + 16) * @sizeOf(f32);
+                const smem_bytes: usize = (1 + @as(usize, @intFromBool(d.has_ref))) * (2 * rr + d.blk_y) * (2 * rr + d.blk_x) * @sizeOf(f32);
                 if (cl.c.clSetKernelArg(k.handle, 8, smem_bytes, null) != cl.c.CL_SUCCESS)
                     return error.SetKernelArg;
             }
@@ -186,10 +208,10 @@ const Stream = struct {
     }
 
     pub fn deinit(self: *Stream) void {
-        _ = cl.c.clEnqueueUnmapMemObject(self.queue.handle, self.stage.handle, self.host.ptr, 0, null, null);
+        if (self.stage) |st| _ = cl.c.clEnqueueUnmapMemObject(self.queue.handle, st.handle, self.host.ptr, 0, null, null);
         _ = cl.c.clFinish(self.queue.handle);
         self.releaseKernels();
-        self.stage.release();
+        if (self.stage) |st| st.release() else allocator.free(self.host);
         if (self.has_raw) self.raw.release();
         self.dst.release();
         self.src.release();
@@ -208,8 +230,12 @@ const kernel_src =
     \\#ifndef HALF
     \\#define HALF 0
     \\#endif
+    \\#ifndef BLOCK_X
     \\#define BLOCK_X 16
+    \\#endif
+    \\#ifndef BLOCK_Y
     \\#define BLOCK_Y 8
+    \\#endif
     \\
     \\#if BITS != 32
     \\// io wire type. u8/u16 LOAD = the shipped bilateralgpu Windows binary's exact reciprocal
@@ -235,14 +261,17 @@ const kernel_src =
     \\// Boundary converters (== upstream's CPU h_buffer conversion, moved on-device). The
     \\// global store in convert_in forces the RN rounding of the conversion multiply, so the
     \\// bilateral kernels consume EXACTLY the values upstream's kernel sees in h_buffer.
-    \\__kernel __attribute__((reqd_work_group_size(256, 1, 1)))
+    \\#ifndef CONV_WG
+    \\#define CONV_WG 256
+    \\#endif
+    \\__kernel __attribute__((reqd_work_group_size(CONV_WG, 1, 1)))
     \\void convert_in(__global float *restrict dstf, __global const io_t *restrict srcr, const int n)
     \\{
     \\    const int i = get_global_id(0);
     \\    if (i < n) dstf[i] = LOADI(srcr, i);
     \\}
     \\
-    \\__kernel __attribute__((reqd_work_group_size(256, 1, 1)))
+    \\__kernel __attribute__((reqd_work_group_size(CONV_WG, 1, 1)))
     \\void convert_out(__global io_t *restrict dstr, __global const float *restrict srcf, const int n)
     \\{
     \\    const int i = get_global_id(0);
@@ -377,21 +406,21 @@ fn process(d: *Data, s: *Stream, src: ZFrame, ref: ?ZFrame, dst: ZFrameW) !void 
         @memcpy(reg[0..plane_bytes], src.getReadSlice(p));
         if (has_ref) @memcpy(reg[plane_bytes..][0..plane_bytes], ref.?.getReadSlice(p));
 
-        const lws: [2]usize = .{ 16, 8 };
+        const lws: [2]usize = .{ d.blk_x, d.blk_y };
         const gws: [2]usize = .{
-            vsh.ceilN(@as(usize, @intCast(cfg.w)), 16),
-            vsh.ceilN(@as(usize, @intCast(cfg.h)), 8),
+            vszipcl.ceilTo(@as(usize, @intCast(cfg.w)), d.blk_x),
+            vszipcl.ceilTo(@as(usize, @intCast(cfg.h)), d.blk_y),
         };
         const ci = d.plane_cfg[p];
 
         if (d.bits != 32) {
-            const lws1: [1]usize = .{256};
+            const lws1: [1]usize = .{d.conv_wg};
             const n_out: usize = plane_elems;
             const n_in: usize = (1 + @as(usize, @intFromBool(has_ref))) * n_out;
             try writeBuf(s, s.raw.handle, reg);
-            try ndr(s, s.cin[ci], &.{vsh.ceilN(n_in, 256)}, &lws1);
+            try ndr(s, s.cin[ci], &.{vszipcl.ceilTo(n_in, d.conv_wg)}, &lws1);
             try ndr(s, s.kernels[ci], &gws, &lws);
-            try ndr(s, s.cout[ci], &.{vsh.ceilN(n_out, 256)}, &lws1);
+            try ndr(s, s.cout[ci], &.{vszipcl.ceilTo(n_out, d.conv_wg)}, &lws1);
             try readBuf(s, s.raw.handle, reg[0..plane_bytes]);
         } else {
             try writeBuf(s, s.src.handle, reg);
@@ -594,13 +623,47 @@ pub fn create(in: ?*const vs.Map, out: ?*vs.Map, _: ?*anyopaque, core: ?*vs.Core
         d.buff_stage = @max(1, off);
     }
 
+    vszipcl.initContext(&d, @intCast(device_id)) catch |err| {
+        map_out.setError(if (err == error.InvalidDeviceID) "Bilateral: invalid device ID." else "Bilateral: OpenCL initialization failed.");
+        std.log.err("Bilateral OpenCL init failed: {}", .{err});
+        return;
+    };
+    d.blk_x = 16;
+    d.blk_y = 8;
+    d.smem_budget = @min(@as(usize, 48 * 1024), vszipcl.deviceLocalMemSize(d.device));
+    d.use_pinned = true;
+    d.conv_wg = @min(@as(usize, 256), vszipcl.deviceMaxWG(d.device));
+    {
+        var terr: ?[:0]const u8 = null;
+        if (map_in.numElements("tune")) |n| {
+            if (n > tune_len) terr = "Bilateral: tune expects at most 4 entries [blk_x, blk_y, smem_kib, pinned].";
+        }
+        if (vszipcl.tuneEntry(map_in, 0)) |v| {
+            if (v < 1 or v > 64) terr = "Bilateral: tune[0] (blk_x) must be 1..64." else d.blk_x = @intCast(v);
+        }
+        if (vszipcl.tuneEntry(map_in, 1)) |v| {
+            if (v < 1 or v > 64) terr = "Bilateral: tune[1] (blk_y) must be 1..64." else d.blk_y = @intCast(v);
+        }
+        if (vszipcl.tuneEntry(map_in, 2)) |v| {
+            if (v < 1 or v > 1024) terr = "Bilateral: tune[2] (smem_kib) must be 1..1024." else d.smem_budget = @min(@as(usize, @intCast(v)) * 1024, vszipcl.deviceLocalMemSize(d.device));
+        }
+        if (vszipcl.tuneEntry(map_in, 3)) |v| {
+            if (v > 1) terr = "Bilateral: tune[3] (pinned) must be 0 or 1." else d.use_pinned = v != 0;
+        }
+        if (d.blk_x * d.blk_y > vszipcl.deviceMaxWG(d.device)) terr = "Bilateral: tune blk_x*blk_y exceeds the device max work-group size.";
+        if (terr) |msg| {
+            map_out.setError(msg);
+            d.context.release();
+            return;
+        }
+    }
     d.n_cfg = 0;
     {
         var pi: usize = 0;
         while (pi < @as(usize, @intCast(fmt.numPlanes))) : (pi += 1) {
             if (!d.process[pi]) continue;
             const rr: usize = @intCast(d.radius[pi]);
-            const smem_bytes: usize = (1 + @as(usize, @intFromBool(d.has_ref))) * (2 * rr + 8) * (2 * rr + 16) * @sizeOf(f32);
+            const smem_bytes: usize = (1 + @as(usize, @intFromBool(d.has_ref))) * (2 * rr + d.blk_y) * (2 * rr + d.blk_x) * @sizeOf(f32);
             const cfg: Config = .{
                 .radius = d.radius[pi],
                 .w = if (pi == 0) d.vi.width else d.vi.width >> subW,
@@ -608,7 +671,7 @@ pub fn create(in: ?*const vs.Map, out: ?*vs.Map, _: ?*anyopaque, core: ?*vs.Core
                 .stride = @intCast(if (pi == 0) strides[0] else strides[1]),
                 .sp = d.sig_sp_scaled[pi],
                 .sc = d.sig_col_scaled[pi],
-                .use_sm = d.use_shared_memory and smem_bytes < 48 * 1024,
+                .use_sm = d.use_shared_memory and smem_bytes < d.smem_budget,
             };
             var ci: usize = 0;
             while (ci < d.n_cfg) : (ci += 1) {
@@ -621,12 +684,6 @@ pub fn create(in: ?*const vs.Map, out: ?*vs.Map, _: ?*anyopaque, core: ?*vs.Core
             d.plane_cfg[pi] = ci;
         }
     }
-
-    vszipcl.initContext(&d, @intCast(device_id)) catch |err| {
-        map_out.setError(if (err == error.InvalidDeviceID) "Bilateral: invalid device ID." else "Bilateral: OpenCL initialization failed.");
-        std.log.err("Bilateral OpenCL init failed: {}", .{err});
-        return;
-    };
 
     d.pool = .{};
     const data: *Data = allocator.create(Data) catch unreachable;

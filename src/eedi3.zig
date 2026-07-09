@@ -13,6 +13,7 @@ const allocator = std.heap.c_allocator;
 
 const mdis_max = 40;
 const tpitch_max = 2 * mdis_max + 1;
+const tune_len = 4;
 
 const kernel_src =
     \\#define TPMAX 85  /* tpitch_max + 4 sentinels (2 per side; K=2 fused DP reads tid..tid+4) */
@@ -158,9 +159,12 @@ const kernel_src =
     \\#define RUN 8                  /* consecutive x per fill unit; BX % RUN == 0 */
     \\#endif
     \\#ifndef RUN_HP
-    \\#define RUN_HP 4               /* hp run length: 4 measured ~+4% over 8 (the hp kernel
-    \\                                  sits at the 96-reg cap, shorter runs ease the pressure;
-    \\                                  16 collapsed hp ~-17%). BX % RUN_HP == 0. */
+    \\#define RUN_HP 4               /* hp run length; BX % RUN_HP == 0. The original "4 beat
+    \\                                  8 by ~4%" measurement PREDATES the round-4 fill rework
+    \\                                  + reg cap: re-measured 2026-07 on the shipped kernel,
+    \\                                  tune run_hp=8 now WINS +4.6% at heavy hp (see tune.md
+    \\                                  RTX 30 table) — default left at 4 pending a full
+    \\                                  multi-config gate; 16 collapsed hp ~-17%. */
     \\#endif
     \\
     \\static float h_pos(global const float * restrict r3p, global const float * restrict r1p,
@@ -901,7 +905,6 @@ const Data = struct {
     configs: [max_cfg]Config = undefined,
     n_cfg: usize = 0,
     plane_cfg: [3]usize = .{ 0, 0, 0 },
-
     off_io: [3]u32 = .{ 0, 0, 0 },
     off_src: [3]u32 = .{ 0, 0, 0 },
     off_dmap: [3]u32 = .{ 0, 0, 0 },
@@ -909,7 +912,6 @@ const Data = struct {
     sum_src: usize = 0,
     sum_dmap: usize = 0,
     vc_geom: [18]i32 = [_]i32{0} ** 18,
-
     rowidx_host: [max_cfg][2][]i32 = undefined,
     dsty_host: [max_cfg][2][]i32 = undefined,
 
@@ -917,6 +919,10 @@ const Data = struct {
     lws: usize = 0,
     max_wg: usize = 256,
     is_nv: bool = false,
+    local_mem: usize = 32 * 1024,
+    bx: u32 = 48,
+    run: u32 = 8,
+    run_hp: u32 = 4,
     pad: u32 = 0,
     platform: cl.Platform = undefined,
     device: cl.Device = undefined,
@@ -956,11 +962,15 @@ const Stream = struct {
         self.n_tbl_sets = 0;
         self.program = try cl.createProgramWithSource(d.context, kernel_src);
         errdefer self.program.release();
-
-        const bx: u32 = 48;
+        const bx: u32 = d.bx;
+        var run_buf: [64]u8 = undefined;
+        const run_opt: []const u8 = if (d.run != 8 or d.run_hp != 4)
+            std.fmt.bufPrint(&run_buf, " -DRUN={d} -DRUN_HP={d}", .{ d.run, d.run_hp }) catch unreachable
+        else
+            "";
         const nv_opt: []const u8 = if (d.is_nv) " -cl-nv-maxrregcount=96" else "";
         const vc_wg: usize = @min(@as(usize, 1024), d.max_wg);
-        const build_opts = try std.fmt.allocPrintSentinel(allocator, "-cl-std=CL1.2 -DCN={d} -DMDIS={d} -DBX={d} -DBITS={d} -DHALF={d} -DVC_WG={d}{s}", .{ d.nrad, d.mdis, bx, d.bits, @intFromBool(d.half), vc_wg, nv_opt }, 0);
+        const build_opts = try std.fmt.allocPrintSentinel(allocator, "-cl-std=CL1.2 -DCN={d} -DMDIS={d} -DBX={d} -DBITS={d} -DHALF={d} -DVC_WG={d}{s}{s}", .{ d.nrad, d.mdis, bx, d.bits, @intFromBool(d.half), vc_wg, run_opt, nv_opt }, 0);
         defer allocator.free(build_opts);
         self.program.build(&.{d.device}, build_opts) catch |err| {
             if (err == error.BuildProgramFailure) {
@@ -972,7 +982,6 @@ const Stream = struct {
         };
         self.queue = try cl.createCommandQueue(d.context, d.device, .{});
         errdefer self.queue.release();
-
         errdefer _ = cl.c.clFinish(self.queue.handle);
         const c0 = &d.configs[0];
         const bytes: usize = d.bytes;
@@ -1090,7 +1099,6 @@ const Stream = struct {
         try self.k_copy[ci].setArg(c_int, 4, @intFromBool(d.dh));
         try self.k_copy[ci].setArg(c_int, 6, src_h_i);
         try self.k_copy[ci].setArg(c_int, 7, @intCast(cfg.dst_h));
-
         const dual: c_int = @intFromBool(d.vcheck > 0);
         try self.k_copy[ci].setArg(@TypeOf(self.d_dst2), 8, self.d_dst2);
         try self.k_copy[ci].setArg(c_int, 9, dual);
@@ -1100,7 +1108,6 @@ const Stream = struct {
         const ik = if (d.hp) self.k_interp_hp[ci] else self.k_interp[ci];
         try ik.setArg(@TypeOf(self.d_dst), 0, self.d_dst);
         try ik.setArg(@TypeOf(self.d_srcpad), 1, self.d_srcpad);
-
         try ik.setArg(@TypeOf(self.d_rowidx[ci][0]), 2, self.d_rowidx[ci][0]);
         try ik.setArg(@TypeOf(self.d_dsty[ci][0]), 3, self.d_dsty[ci][0]);
         try ik.setArg(@TypeOf(self.d_pbackt), 4, self.d_pbackt);
@@ -1115,7 +1122,6 @@ const Stream = struct {
         try ik.setArg(f32, 13, d.beta);
         try ik.setArg(f32, 14, d.gamma);
         try ik.setArg(f32, 15, d.one_minus_ab);
-
         if (d.hp) {
             try ik.setArg(@TypeOf(self.d_hpsrcpad), 16, self.d_hpsrcpad);
             try ik.setArg(@TypeOf(self.d_dst2), 17, self.d_dst2);
@@ -1194,12 +1200,12 @@ fn initOpenCL(d: *Data, device_id: usize) !void {
     if (cl.c.clGetDeviceInfo(d.device.id, cl.c.CL_DEVICE_MAX_WORK_GROUP_SIZE, @sizeOf(usize), &dev_max_wg, null) == cl.c.CL_SUCCESS and dev_max_wg > 0) {
         d.max_wg = dev_max_wg;
     }
-
     var vend: [256]u8 = undefined;
     var vlen: usize = 0;
     if (cl.c.clGetDeviceInfo(d.device.id, cl.c.CL_DEVICE_VENDOR, vend.len, &vend, &vlen) == cl.c.CL_SUCCESS and vlen > 0) {
         d.is_nv = std.mem.indexOf(u8, vend[0..vlen], "NVIDIA") != null;
     }
+    d.local_mem = vszipcl.deviceLocalMemSize(d.device);
 }
 
 const ndr = vszipcl.ndr;
@@ -1224,7 +1230,6 @@ fn processPlane(d: *Data, s: *Stream, ci: usize, plane: usize, srcp: []const u8,
     const ik = if (d.hp) s.k_interp_hp[ci] else s.k_interp[ci];
     try ik.setArg(@TypeOf(s.d_rowidx[ci][fb]), 2, s.d_rowidx[ci][fb]);
     try ik.setArg(@TypeOf(s.d_dsty[ci][fb]), 3, s.d_dsty[ci][fb]);
-
     if (d.hp) {
         try ik.setArg(c_int, 19, off_io);
         try ik.setArg(c_int, 20, off_dm);
@@ -1279,7 +1284,6 @@ fn vcheckFused(d: *Data, s: *Stream, field: u8) !void {
         try kv.setArg(@TypeOf(s.d_rowidx[ci][fb]), @intCast(3 + p), s.d_rowidx[ci][fb]);
     }
     try kv.setArg(c_int, 9, field);
-
     const vc_wg: usize = @min(@as(usize, 1024), d.max_wg);
     const vc_gws: [1]usize = .{vc_wg * np};
     const vc_lws: [1]usize = .{vc_wg};
@@ -1524,7 +1528,6 @@ fn createImpl(in: ?*const vs.Map, out: ?*vs.Map, _: ?*anyopaque, core_ptr: ?*vs.
     d.rcp2 = 1.0 / d.vthresh2;
 
     d.tpitch = @intCast(if (d.hp) 4 * mdis + 1 else 2 * mdis + 1);
-    d.lws = @max(vsh.ceilN(@as(usize, d.tpitch), 32), 128);
     d.pad = @intCast(3 * mdis + nrad + 2);
 
     {
@@ -1546,7 +1549,6 @@ fn createImpl(in: ?*const vs.Map, out: ?*vs.Map, _: ?*anyopaque, core_ptr: ?*vs.
                 cfg.dst_h = cfg.out_w;
                 cfg.in_stride = strides_in[cat];
                 cfg.out_stride = strides_out[cat];
-
                 const n_align: u32 = @divExact(vszipcl.vsFrameAlignment(), @as(u32, @intCast(d.vi.format.bytesPerSample)));
                 cfg.stride = @max(strides_out[cat], @as(u32, @intCast(vsh.ceilN(@as(usize, cfg.w), n_align))));
             } else {
@@ -1580,7 +1582,6 @@ fn createImpl(in: ?*const vs.Map, out: ?*vs.Map, _: ?*anyopaque, core_ptr: ?*vs.
             acc_src += @as(u64, cfg.stride) * cfg.src_h;
             acc_dm += @as(u64, cfg.n_interp_max) * cfg.stride;
         }
-
         const plane0: u64 = @as(u64, d.configs[0].stride) * d.configs[0].dst_h;
         const max_extent = @max(plane0, if (vcheck > 0) @max(acc_io, @max(acc_src, acc_dm)) else 0);
         if (max_extent >= (1 << 31)) {
@@ -1641,6 +1642,66 @@ fn createImpl(in: ?*const vs.Map, out: ?*vs.Map, _: ?*anyopaque, core_ptr: ?*vs.
         return;
     };
 
+    d.bx = 48;
+    d.run = 8;
+    d.run_hp = 4;
+    var lws_floor: usize = 128;
+    {
+        var terr: ?[:0]const u8 = null;
+        if (map_in.numElements("tune")) |n| {
+            if (n > tune_len) terr = "EEDI3: tune expects at most 4 entries [bx, run, run_hp, lws_floor].";
+        }
+        if (vszipcl.tuneEntry(map_in, 0)) |v| {
+            if (v < 8 or v > 256) terr = "EEDI3: tune[0] (bx) must be 8..256." else d.bx = @intCast(v);
+        }
+        if (vszipcl.tuneEntry(map_in, 1)) |v| {
+            if (v < 1 or v > 64) terr = "EEDI3: tune[1] (run) must be 1..64." else d.run = @intCast(v);
+        }
+        if (vszipcl.tuneEntry(map_in, 2)) |v| {
+            if (v < 1 or v > 64) terr = "EEDI3: tune[2] (run_hp) must be 1..64." else d.run_hp = @intCast(v);
+        }
+        if (vszipcl.tuneEntry(map_in, 3)) |v| {
+            if (v < 32 or v > 1024) terr = "EEDI3: tune[3] (lws_floor) must be 32..1024." else lws_floor = @intCast(v);
+        }
+        if (terr == null and (d.bx % d.run != 0 or d.bx % d.run_hp != 0))
+            terr = "EEDI3: tune bx must be a multiple of both run and run_hp.";
+        if (terr) |msg| {
+            map_out.setError(msg);
+            d.context.release();
+            freeStencilTables(&d);
+            return;
+        }
+    }
+    {
+        const step: u32 = (d.run * d.run_hp) / std.math.gcd(d.run, d.run_hp);
+        const want: u32 = d.bx;
+        const tph: usize = 4 * @as(usize, d.mdis) + 1;
+        const budget = d.local_mem -| 1024;
+        var bx = want;
+        while (bx > step and (@as(usize, bx) * tph + 2 * 165) * 4 > budget) bx -= step;
+        if ((@as(usize, bx) * tph + 2 * 165) * 4 > budget) {
+            map_out.setError("EEDI3: no strip width fits the device local memory at this mdis (lower mdis, run or run_hp).");
+            d.context.release();
+            freeStencilTables(&d);
+            return;
+        }
+        if (bx != want) std.log.warn("EEDI3: tune BX {d} over the local-mem budget ({d} B = device {d} B - 1 KiB reserve) — clamped to {d}.", .{ want, budget, d.local_mem, bx });
+        d.bx = bx;
+    }
+    d.lws = @max(vsh.ceilN(@as(usize, d.tpitch), 32), lws_floor);
+    if (d.lws > d.max_wg) d.lws = vsh.ceilN(@as(usize, d.tpitch), 32);
+    if (d.lws > d.max_wg) {
+        map_out.setError("EEDI3: device max work-group size is too small for this mdis.");
+        d.context.release();
+        freeStencilTables(&d);
+        return;
+    }
+    if (horizontal and d.max_wg < 256) {
+        map_out.setError("EEDI3H: device max work-group size < 256 (required by the transpose kernel).");
+        d.context.release();
+        freeStencilTables(&d);
+        return;
+    }
     const data: *Data = allocator.create(Data) catch unreachable;
     data.* = d;
     keep = true;
@@ -1665,6 +1726,5 @@ fn createImpl(in: ?*const vs.Map, out: ?*vs.Map, _: ?*anyopaque, core_ptr: ?*vs.
         dep_buf[ndeps] = .{ .source = sc, .requestPattern = .StrictSpatial };
         ndeps += 1;
     }
-
     zapi.createVideoFilter(out, if (horizontal) "EEDI3H" else "EEDI3", &d.vi, getFrame, free, .Parallel, dep_buf[0..ndeps], data);
 }

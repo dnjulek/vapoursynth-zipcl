@@ -262,6 +262,7 @@ const FLT_EPS: f32 = 1.1920929e-7;
 const nlm_qb_small: u32 = 8;
 const nlm_qb_large: u32 = 4;
 
+const tune_len = 5;
 const Variant = struct {
     w_base: u32,
     q_base: u32,
@@ -302,6 +303,9 @@ const Data = struct {
     use_pinned: bool = true,
     qb: u32 = nlm_qb_small,
 
+    blk_x: usize = 16,
+    blk_y: usize = 8,
+    vrt: usize = 3,
     wq_host: []i32 = &.{},
     aq_host: []i32 = &.{},
     variants: []Variant = &.{},
@@ -329,7 +333,6 @@ fn mapPinnedMirror(queue: cl.CommandQueue, context: cl.Context, bytes: usize) ?P
         std.log.warn("NLMeans: pinned staging map failed; falling back to pageable transfers.", .{});
         return null;
     }
-
     const host = @as([*]u8, @ptrCast(map_ptr.?))[0..bytes];
     @memset(host, 0);
     return .{ .stage = stage, .host = host };
@@ -348,7 +351,6 @@ const Stream = struct {
     k_weight: cl.Kernel,
     k_accumulation: cl.Kernel,
     k_finish: cl.Kernel,
-
     stage: ?cl.Buffer(u8),
     host: ?[]u8,
 
@@ -370,8 +372,8 @@ const Stream = struct {
         );
         const idx_t: []const u8 = if (idx_max < (1 << 31)) "int" else "long";
         const opts = try std.fmt.allocPrintSentinel(allocator,
-            \\-cl-std=CL1.2 -DVI_DIM_X={d} -DVI_DIM_Y={d} -DSTRIDE={d} -DPSTRIDE={d} -DPAD={d} -DPH={d} -DNLM_S={d} -DNLM_D={d} -DNLM_REF={d} -DNLM_CHANNELS={d} -DWMODE={d} -DBLK_X=16 -DBLK_Y=8 -DVRT_RESULT=3 -DNLM_H={e}f -DNLM_WREF={e}f -DIDX={s} -DBITS={d} -DHALF={d}
-        , .{ d.w, d.h_, d.stride, d.pstride, d.pad, d.ph, d.s, d.d, d.ref, d.chans, d.wmode, d.h, d.wref, idx_t, d.bits, @intFromBool(d.half) }, 0);
+            \\-cl-std=CL1.2 -DVI_DIM_X={d} -DVI_DIM_Y={d} -DSTRIDE={d} -DPSTRIDE={d} -DPAD={d} -DPH={d} -DNLM_S={d} -DNLM_D={d} -DNLM_REF={d} -DNLM_CHANNELS={d} -DWMODE={d} -DBLK_X={d} -DBLK_Y={d} -DVRT_RESULT={d} -DNLM_H={e}f -DNLM_WREF={e}f -DIDX={s} -DBITS={d} -DHALF={d}
+        , .{ d.w, d.h_, d.stride, d.pstride, d.pad, d.ph, d.s, d.d, d.ref, d.chans, d.wmode, d.blk_x, d.blk_y, d.vrt, d.h, d.wref, idx_t, d.bits, @intFromBool(d.half) }, 0);
         defer allocator.free(opts);
         self.program.build(&.{d.device}, opts) catch |err| {
             if (err == error.BuildProgramFailure) {
@@ -415,7 +417,6 @@ const Stream = struct {
             _ = cl.c.clFinish(self.queue.handle);
             self.stage.?.release();
         };
-
         self.stage_r = null;
         self.host_r = null;
         if (d.has_ref and d.use_pinned) {
@@ -578,14 +579,13 @@ fn process(d: *Data, s: *Stream, dstps: []const []u8, srcps: []const []const u8,
     const C: usize = d.chans;
     const wb: usize = d.wbytes;
 
-    const BX: usize = 16;
-    const BY: usize = 8;
-    const VR: usize = 3;
+    const BX: usize = d.blk_x;
+    const BY: usize = d.blk_y;
+    const VR: usize = d.vrt;
     const lws: [2]usize = .{ BX, BY };
-    const gws_pix: [2]usize = .{ vsh.ceilN(@as(usize, d.w), BX), vsh.ceilN(@as(usize, d.h_), BY) };
-
+    const gws_pix: [2]usize = .{ vszipcl.ceilTo(@as(usize, d.w), BX), vszipcl.ceilTo(@as(usize, d.h_), BY) };
     const gws_w: [2]usize = .{
-        vsh.ceilN(@as(usize, d.w), BX),
+        vszipcl.ceilTo(@as(usize, d.w), BX),
         ((@as(usize, d.h_) + VR * BY - 1) / (VR * BY)) * BY,
     };
 
@@ -859,7 +859,47 @@ pub fn create(in: ?*const vs.Map, out: ?*vs.Map, _: ?*anyopaque, core_ptr: ?*vs.
     d.pad = @intCast(a);
     d.pstride = @intCast(vsh.ceilN(@as(usize, d.w) + 2 * @as(usize, d.pad), 8));
     d.ph = d.h_ + 2 * d.pad;
+    vszipcl.initContext(&d, @intCast(device_id)) catch |err| {
+        map_out.setError(if (err == error.InvalidDeviceID) "NLMeans: invalid device ID." else "NLMeans: OpenCL init failed.");
+        std.log.err("NLMeans OpenCL init failed: {}", .{err});
+        return;
+    };
     d.qb = if (@as(u64, d.stride) * @as(u64, d.h_) <= 1920 * 1152) nlm_qb_small else nlm_qb_large;
+    var pin_min: usize = 2;
+    {
+        var terr: ?[:0]const u8 = null;
+        if (map_in.numElements("tune")) |n| {
+            if (n > tune_len) terr = "NLMeans: tune expects at most 5 entries [blk_x, blk_y, vrt, qb, pin_min_streams].";
+        }
+        if (vszipcl.tuneEntry(map_in, 0)) |v| {
+            if (v < 1 or v > 64) terr = "NLMeans: tune[0] (blk_x) must be 1..64." else d.blk_x = @intCast(v);
+        }
+        if (vszipcl.tuneEntry(map_in, 1)) |v| {
+            if (v < 1 or v > 64) terr = "NLMeans: tune[1] (blk_y) must be 1..64." else d.blk_y = @intCast(v);
+        }
+        if (vszipcl.tuneEntry(map_in, 2)) |v| {
+            if (v < 1 or v > 8) terr = "NLMeans: tune[2] (vrt) must be 1..8." else d.vrt = @intCast(v);
+        }
+        if (vszipcl.tuneEntry(map_in, 3)) |v| {
+            if (v < 1 or v > 32) terr = "NLMeans: tune[3] (qb) must be 1..32." else d.qb = @intCast(v);
+        }
+        if (vszipcl.tuneEntry(map_in, 4)) |v| {
+            if (v < 1 or v > 33) terr = "NLMeans: tune[4] (pin_min_streams) must be 1..33." else pin_min = @intCast(v);
+        }
+        if (d.blk_x * d.blk_y > vszipcl.deviceMaxWG(d.device)) terr = "NLMeans: tune blk_x*blk_y exceeds the device max work-group size.";
+        if (terr == null) {
+            const s2: usize = 2 * @as(usize, d.s);
+            const tile_h = d.vrt * d.blk_y + s2;
+            const lds_bytes = (tile_h * (d.blk_x + s2) + tile_h * d.blk_x) * @sizeOf(f32);
+            if (lds_bytes > vszipcl.deviceLocalMemSize(d.device))
+                terr = "NLMeans: tune blk/vrt with this `s` needs more local memory than the device has (lower blk, vrt or s).";
+        }
+        if (terr) |msg| {
+            map_out.setError(msg);
+            d.context.release();
+            return;
+        }
+    }
 
     {
         const spt_side: i32 = 2 * a + 1;
@@ -903,19 +943,12 @@ pub fn create(in: ?*const vs.Map, out: ?*vs.Map, _: ?*anyopaque, core_ptr: ?*vs.
         d.variants = variants;
     }
 
-    vszipcl.initContext(&d, @intCast(device_id)) catch |err| {
-        map_out.setError(if (err == error.InvalidDeviceID) "NLMeans: invalid device ID." else "NLMeans: OpenCL init failed.");
-        std.log.err("NLMeans OpenCL init failed: {}", .{err});
-        freeTables(&d);
-        return;
-    };
-
     const data: *Data = allocator.create(Data) catch unreachable;
     data.* = d;
     keep = true;
 
     const streams: usize = if (ns_req) |ns| @intCast(ns) else 1;
-    data.use_pinned = streams >= 2;
+    data.use_pinned = streams >= pin_min;
     data.pool.prime(data, streams);
     data.pool.prewarm(streams) catch |err| {
         map_out.setError("NLMeans: OpenCL stream init failed.");

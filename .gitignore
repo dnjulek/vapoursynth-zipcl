@@ -11,3 +11,4 @@ build-help/zig-*
 build/
 zig-pkg/
 __pycache__/
+test.vpy

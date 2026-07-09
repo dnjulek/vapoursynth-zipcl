@@ -15,16 +15,17 @@ const deband = @import("deband.zig");
 
 pub const io: std.Io = std.Io.Threaded.global_single_threaded.io();
 
-const eedi3_sig = "clip:vnode;field:int;dh:int:opt;mdis:int:opt;nrad:int:opt;alpha:float:opt;beta:float:opt;gamma:float:opt;hp:int:opt;vcheck:int:opt;vthresh0:float:opt;vthresh1:float:opt;vthresh2:float:opt;sclip:vnode:opt;device_id:int:opt;num_streams:int:opt;";
+pub const std_options: std.Options = .{ .log_level = .warn };
+const eedi3_sig = "clip:vnode;field:int;dh:int:opt;mdis:int:opt;nrad:int:opt;alpha:float:opt;beta:float:opt;gamma:float:opt;hp:int:opt;vcheck:int:opt;vthresh0:float:opt;vthresh1:float:opt;vthresh2:float:opt;sclip:vnode:opt;device_id:int:opt;num_streams:int:opt;tune:int[]:opt;";
 
 export fn VapourSynthPluginInit2(plugin: *vs.Plugin, vspapi: *const vs.PLUGINAPI) void {
     ZAPI.Plugin.config("com.julek.vszipcl", "vszipcl", "VapourSynth Zig Image Process OpenCL", zon.version, plugin, vspapi);
-    ZAPI.Plugin.function("Bilateral", "clip:vnode;sigma_spatial:float[]:opt;sigma_color:float[]:opt;radius:int[]:opt;device_id:int:opt;num_streams:int:opt;use_shared_memory:int:opt;ref:vnode:opt;", "clip:vnode;", bilateral.create, plugin, vspapi);
-    ZAPI.Plugin.function("GaussBlur", "clip:vnode;sigma:float[]:opt;device_id:int:opt;num_streams:int:opt;", "clip:vnode;", gaussglur.create, plugin, vspapi);
+    ZAPI.Plugin.function("Bilateral", "clip:vnode;sigma_spatial:float[]:opt;sigma_color:float[]:opt;radius:int[]:opt;device_id:int:opt;num_streams:int:opt;use_shared_memory:int:opt;ref:vnode:opt;tune:int[]:opt;", "clip:vnode;", bilateral.create, plugin, vspapi);
+    ZAPI.Plugin.function("GaussBlur", "clip:vnode;sigma:float[]:opt;device_id:int:opt;num_streams:int:opt;tune:int[]:opt;", "clip:vnode;", gaussglur.create, plugin, vspapi);
     ZAPI.Plugin.function("EEDI3", eedi3_sig, "clip:vnode;", eedi3.createEEDI3, plugin, vspapi);
     ZAPI.Plugin.function("EEDI3H", eedi3_sig, "clip:vnode;", eedi3.createEEDI3H, plugin, vspapi);
-    ZAPI.Plugin.function("NLMeans", "clip:vnode;d:int:opt;a:int:opt;s:int:opt;h:float:opt;channels:data:opt;wmode:int:opt;wref:float:opt;rclip:vnode:opt;device_id:int:opt;num_streams:int:opt;", "clip:vnode;", nlmeans.create, plugin, vspapi);
-    ZAPI.Plugin.function("Deband", "clip:vnode;iterations:int:opt;threshold:float:opt;radius:float:opt;grain:float:opt;planes:int[]:opt;dither:int:opt;dither_algo:int:opt;device_id:int:opt;num_streams:int:opt;", "clip:vnode;", deband.create, plugin, vspapi);
+    ZAPI.Plugin.function("NLMeans", "clip:vnode;d:int:opt;a:int:opt;s:int:opt;h:float:opt;channels:data:opt;wmode:int:opt;wref:float:opt;rclip:vnode:opt;device_id:int:opt;num_streams:int:opt;tune:int[]:opt;", "clip:vnode;", nlmeans.create, plugin, vspapi);
+    ZAPI.Plugin.function("Deband", "clip:vnode;iterations:int:opt;threshold:float:opt;radius:float:opt;grain:float:opt;planes:int[]:opt;dither:int:opt;dither_algo:int:opt;device_id:int:opt;num_streams:int:opt;tune:int[]:opt;", "clip:vnode;", deband.create, plugin, vspapi);
 }
 
 pub fn initContext(d: anytype, device_id: usize) !void {
@@ -42,6 +43,27 @@ pub fn initContext(d: anytype, device_id: usize) !void {
     d.context = try cl.createContext(&.{d.device}, .{ .platform = d.platform });
 }
 
+pub fn tuneEntry(map_in: anytype, idx: usize) ?i64 {
+    const v = map_in.getInt2(i64, "tune", idx) orelse return null;
+    return if (v < 0) null else v;
+}
+pub fn deviceLocalMemSize(device: cl.Device) usize {
+    var lmem: cl.c.cl_ulong = 0;
+    if (cl.c.clGetDeviceInfo(device.id, cl.c.CL_DEVICE_LOCAL_MEM_SIZE, @sizeOf(cl.c.cl_ulong), &lmem, null) == cl.c.CL_SUCCESS and lmem > 0) {
+        return @intCast(lmem);
+    }
+    return 32 * 1024;
+}
+pub fn deviceMaxWG(device: cl.Device) usize {
+    var wg: usize = 0;
+    if (cl.c.clGetDeviceInfo(device.id, cl.c.CL_DEVICE_MAX_WORK_GROUP_SIZE, @sizeOf(usize), &wg, null) == cl.c.CL_SUCCESS and wg > 0) {
+        return wg;
+    }
+    return 256;
+}
+pub fn ceilTo(n: usize, m: usize) usize {
+    return ((n + m - 1) / m) * m;
+}
 pub fn ndr(s: anytype, k: cl.Kernel, gws: []const usize, lws: []const usize) !void {
     if (cl.c.clEnqueueNDRangeKernel(s.queue.handle, k.handle, @intCast(gws.len), null, gws.ptr, lws.ptr, 0, null, null) != cl.c.CL_SUCCESS)
         return error.EnqueueKernel;
