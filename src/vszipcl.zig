@@ -12,10 +12,14 @@ const gaussglur = @import("gaussglur.zig");
 const eedi3 = @import("eedi3.zig");
 const nlmeans = @import("nlmeans.zig");
 const deband = @import("deband.zig");
+const resample = @import("resample.zig");
+const dfttest = @import("dfttest.zig");
+const bm3d = @import("bm3d.zig");
 
 pub const io: std.Io = std.Io.Threaded.global_single_threaded.io();
 
 pub const std_options: std.Options = .{ .log_level = .warn };
+
 const eedi3_sig = "clip:vnode;field:int;dh:int:opt;mdis:int:opt;nrad:int:opt;alpha:float:opt;beta:float:opt;gamma:float:opt;hp:int:opt;vcheck:int:opt;vthresh0:float:opt;vthresh1:float:opt;vthresh2:float:opt;sclip:vnode:opt;device_id:int:opt;num_streams:int:opt;tune:int[]:opt;";
 
 export fn VapourSynthPluginInit2(plugin: *vs.Plugin, vspapi: *const vs.PLUGINAPI) void {
@@ -25,7 +29,46 @@ export fn VapourSynthPluginInit2(plugin: *vs.Plugin, vspapi: *const vs.PLUGINAPI
     ZAPI.Plugin.function("EEDI3", eedi3_sig, "clip:vnode;", eedi3.createEEDI3, plugin, vspapi);
     ZAPI.Plugin.function("EEDI3H", eedi3_sig, "clip:vnode;", eedi3.createEEDI3H, plugin, vspapi);
     ZAPI.Plugin.function("NLMeans", "clip:vnode;d:int:opt;a:int:opt;s:int:opt;h:float:opt;channels:data:opt;wmode:int:opt;wref:float:opt;rclip:vnode:opt;device_id:int:opt;num_streams:int:opt;tune:int[]:opt;", "clip:vnode;", nlmeans.create, plugin, vspapi);
-    ZAPI.Plugin.function("Deband", "clip:vnode;iterations:int:opt;threshold:float:opt;radius:float:opt;grain:float:opt;planes:int[]:opt;dither:int:opt;dither_algo:int:opt;device_id:int:opt;num_streams:int:opt;tune:int[]:opt;", "clip:vnode;", deband.create, plugin, vspapi);
+    ZAPI.Plugin.function("Deband", "clip:vnode;iterations:int[]:opt;threshold:float[]:opt;radius:float[]:opt;grain:float[]:opt;planes:int[]:opt;dither:int:opt;dither_algo:int:opt;device_id:int:opt;num_streams:int:opt;tune:int[]:opt;", "clip:vnode;", deband.create, plugin, vspapi);
+    ZAPI.Plugin.function(
+        "Resample",
+        "clip:vnode;width:int;height:int;filter:data:opt;clamp:float:opt;blur:float:opt;" ++
+            "taper:float:opt;radius:float:opt;param1:float:opt;param2:float:opt;" ++
+            "src_width:float:opt;src_height:float:opt;sx:float:opt;sy:float:opt;antiring:float:opt;" ++
+            "sigmoidize:int:opt;sigmoid_center:float:opt;sigmoid_slope:float:opt;linearize:int:opt;trc:int:opt;" ++
+            "min_luma:float:opt;device_id:int:opt;num_streams:int:opt;tune:int[]:opt;",
+        "clip:vnode;",
+        resample.create,
+        plugin,
+        vspapi,
+    );
+    ZAPI.Plugin.function(
+        "DFTTest",
+        "clip:vnode;ftype:int:opt;sigma:float:opt;sigma2:float:opt;pmin:float:opt;" ++
+            "pmax:float:opt;sbsize:int:opt;sosize:int:opt;tbsize:int:opt;swin:int:opt;" ++
+            "twin:int:opt;sbeta:float:opt;tbeta:float:opt;zmean:int:opt;f0beta:float:opt;" ++
+            "slocation:float[]:opt;ssx:float[]:opt;ssy:float[]:opt;sst:float[]:opt;" ++
+            "ssystem:int:opt;planes:int[]:opt;device_id:int:opt;num_streams:int:opt;tune:int[]:opt;",
+        "clip:vnode;",
+        dfttest.create,
+        plugin,
+        vspapi,
+    );
+    const bm3d_sig = "clip:vnode;ref:vnode:opt;sigma:float[]:opt;block_step:int[]:opt;" ++
+        "bm_range:int[]:opt;radius:int:opt;ps_num:int[]:opt;ps_range:int[]:opt;" ++
+        "chroma:int:opt;device_id:int:opt;num_streams:int:opt;" ++
+        "extractor_exp:int:opt;bm_error_s:data[]:opt;transform_2d_s:data[]:opt;" ++
+        "transform_1d_s:data[]:opt;zero_init:int:opt;fast_fused:int:opt;tune:int[]:opt;";
+    ZAPI.Plugin.function("BM3D", bm3d_sig, "clip:vnode;", bm3d.create, plugin, vspapi);
+    ZAPI.Plugin.function("BM3Dv2", bm3d_sig, "clip:vnode;", bm3d.createV2, plugin, vspapi);
+    ZAPI.Plugin.function(
+        "VAggregate",
+        "clip:vnode;src:vnode;planes:int[];",
+        "clip:vnode;",
+        bm3d.createVAggregate,
+        plugin,
+        vspapi,
+    );
 }
 
 pub fn initContext(d: anytype, device_id: usize) !void {
@@ -47,6 +90,7 @@ pub fn tuneEntry(map_in: anytype, idx: usize) ?i64 {
     const v = map_in.getInt2(i64, "tune", idx) orelse return null;
     return if (v < 0) null else v;
 }
+
 pub fn deviceLocalMemSize(device: cl.Device) usize {
     var lmem: cl.c.cl_ulong = 0;
     if (cl.c.clGetDeviceInfo(device.id, cl.c.CL_DEVICE_LOCAL_MEM_SIZE, @sizeOf(cl.c.cl_ulong), &lmem, null) == cl.c.CL_SUCCESS and lmem > 0) {
@@ -54,6 +98,7 @@ pub fn deviceLocalMemSize(device: cl.Device) usize {
     }
     return 32 * 1024;
 }
+
 pub fn deviceMaxWG(device: cl.Device) usize {
     var wg: usize = 0;
     if (cl.c.clGetDeviceInfo(device.id, cl.c.CL_DEVICE_MAX_WORK_GROUP_SIZE, @sizeOf(usize), &wg, null) == cl.c.CL_SUCCESS and wg > 0) {
@@ -61,9 +106,11 @@ pub fn deviceMaxWG(device: cl.Device) usize {
     }
     return 256;
 }
+
 pub fn ceilTo(n: usize, m: usize) usize {
     return ((n + m - 1) / m) * m;
 }
+
 pub fn ndr(s: anytype, k: cl.Kernel, gws: []const usize, lws: []const usize) !void {
     if (cl.c.clEnqueueNDRangeKernel(s.queue.handle, k.handle, @intCast(gws.len), null, gws.ptr, lws.ptr, 0, null, null) != cl.c.CL_SUCCESS)
         return error.EnqueueKernel;
