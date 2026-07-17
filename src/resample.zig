@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const vszipcl = @import("vszipcl.zig");
 const clpool = @import("clpool.zig");
 
@@ -12,11 +13,19 @@ const ZAPI = vapoursynth.ZAPI;
 const allocator = std.heap.c_allocator;
 
 const libm = struct {
-    extern fn _j1(x: f64) f64;
     extern fn powf(x: f32, y: f32) f32;
     extern fn expf(x: f32) f32;
     extern fn log2f(x: f32) f32;
 };
+
+const besselJ1 = if (builtin.os.tag == .windows)
+    struct {
+        extern fn _j1(x: f64) f64;
+    }._j1
+else
+    struct {
+        extern fn j1(x: f64) f64;
+    }.j1;
 
 const SCALER_LUT_SIZE = 256;
 const POLAR_CUTOFF: f32 = 1e-3;
@@ -115,7 +124,7 @@ fn wSinc(_: *const FilterCtx, x_in: f64) f64 {
 fn wJinc(_: *const FilterCtx, x_in: f64) f64 {
     if (x_in < 1e-8) return 1.0;
     const x = x_in * math.pi;
-    return 2.0 * libm._j1(x) / x;
+    return 2.0 * besselJ1(x) / x;
 }
 
 fn wSphinx(_: *const FilterCtx, x_in: f64) f64 {
