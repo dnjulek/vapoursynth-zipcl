@@ -1,6 +1,7 @@
 const std = @import("std");
 const vszipcl = @import("vszipcl.zig");
 const clpool = @import("clpool.zig");
+const clframecache = @import("clframecache.zig");
 
 const cl = vszipcl.cl;
 const vapoursynth = vszipcl.vapoursynth;
@@ -9,6 +10,7 @@ const vsh = vapoursynth.vshelper;
 const ZAPI = vapoursynth.ZAPI;
 
 const allocator = std.heap.c_allocator;
+
 const REF_LUMA: u8 = 0;
 const REF_CHROMA: u8 = 1;
 const REF_YUV: u8 = 2;
@@ -259,10 +261,12 @@ const kernel_src =
 ;
 
 const FLT_EPS: f32 = 1.1920929e-7;
+
 const nlm_qb_small: u32 = 8;
 const nlm_qb_large: u32 = 4;
 
-const tune_len = 5;
+const tune_len = 6;
+
 const Variant = struct {
     w_base: u32,
     q_base: u32,
@@ -273,6 +277,7 @@ const Variant = struct {
 const Data = struct {
     node: ?*vs.Node = null,
     vi: vs.VideoInfo = undefined,
+
     ref_node: ?*vs.Node = null,
     has_ref: bool = false,
 
@@ -286,6 +291,7 @@ const Data = struct {
     ref: u8 = REF_LUMA,
     chans: u8 = 1,
     plane0: u8 = 0,
+
     bits: i32 = 32,
     half: bool = false,
     wbytes: u32 = 4,
@@ -306,11 +312,25 @@ const Data = struct {
     blk_x: usize = 16,
     blk_y: usize = 8,
     vrt: usize = 3,
+
     wq_host: []i32 = &.{},
     aq_host: []i32 = &.{},
     variants: []Variant = &.{},
 
     pool: clpool.Pool(Stream, Data) = .{},
+
+    use_cache: bool = false,
+    cache: clframecache.FrameCache = .{},
+    slot_bytes: usize = 0,
+};
+
+const CacheWin = struct {
+    n: usize = 0,
+    count: usize = 0,
+    keys: [66]i64 = undefined,
+    idx: [66]usize = undefined,
+    load: [66]bool = undefined,
+    published: [66]bool = undefined,
 };
 
 fn freeTables(d: *Data) void {
@@ -357,6 +377,8 @@ const Stream = struct {
     d_u1r: ?cl.Buffer(u8),
     stage_r: ?cl.Buffer(u8),
     host_r: ?[]u8,
+    stage_out: ?cl.Buffer(u8),
+    host_out: ?[]u8,
 
     pub fn init(self: *Stream, d: *Data) !void {
         const npix = d.stride * d.h_;
@@ -430,6 +452,19 @@ const Stream = struct {
             _ = cl.c.clFinish(self.queue.handle);
             self.stage_r.?.release();
         };
+        self.stage_out = null;
+        self.host_out = null;
+        if (d.use_pinned) {
+            if (mapPinnedMirror(self.queue, d.context, @as(usize, d.stride) * @as(usize, d.h_) * c * wb)) |pm| {
+                self.stage_out = pm.stage;
+                self.host_out = pm.host;
+            }
+        }
+        errdefer if (self.host_out) |h| {
+            _ = cl.c.clEnqueueUnmapMemObject(self.queue.handle, self.stage_out.?.handle, h.ptr, 0, null, null);
+            _ = cl.c.clFinish(self.queue.handle);
+            self.stage_out.?.release();
+        };
         self.k_weight = try cl.createKernel(self.program, "nlmWeight");
         errdefer self.k_weight.release();
         self.k_accumulation = try cl.createKernel(self.program, "nlmAccumulation");
@@ -466,11 +501,16 @@ const Stream = struct {
             _ = cl.c.clEnqueueUnmapMemObject(self.queue.handle, self.stage_r.?.handle, h.ptr, 0, null, null);
             _ = cl.c.clFinish(self.queue.handle);
         }
+        if (self.host_out) |h| {
+            _ = cl.c.clEnqueueUnmapMemObject(self.queue.handle, self.stage_out.?.handle, h.ptr, 0, null, null);
+            _ = cl.c.clFinish(self.queue.handle);
+        }
         self.k_finish.release();
         self.k_accumulation.release();
         self.k_weight.release();
         if (self.stage) |st| st.release();
         if (self.stage_r) |st| st.release();
+        if (self.stage_out) |st| st.release();
         if (self.d_u1r) |b| b.release();
         self.d_aq.release();
         self.d_wq.release();
@@ -529,6 +569,7 @@ fn writeU1(d: *Data, s: *Stream, buf: cl.Buffer(u8), c: usize, t_layer: usize, s
 fn writeBuf(s: *Stream, buf: cl.Buffer(u8), off: usize, src: []const u8) !void {
     return vszipcl.enqWrite(s.queue, buf.handle, off, src);
 }
+
 fn readBuf(s: *Stream, buf: cl.Buffer(u8), offset: usize, dst: []u8) !void {
     return vszipcl.enqRead(s.queue, buf.handle, offset, dst);
 }
@@ -574,7 +615,44 @@ fn uploadWindow(d: *Data, s: *Stream, buf: cl.Buffer(u8), host_opt: ?[]u8, srcps
     }
 }
 
-fn process(d: *Data, s: *Stream, dstps: []const []u8, srcps: []const []const u8, refps: ?[]const []const u8, k_start: i32, k_end: i32) !void {
+fn uploadSlot(d: *Data, s: *Stream, slot: *clframecache.CacheSlot, host_opt: ?[]u8, srcps: []const []const u8, fi: usize, t_layer: usize) !void {
+    const C: usize = d.chans;
+    const layers = 2 * @as(usize, d.d) + 1;
+    const wb: usize = d.wbytes;
+    const pp: usize = d.pstride;
+    const lay: usize = pp * @as(usize, d.ph);
+    const pad: usize = d.pad;
+    const w: usize = d.w;
+    if (slot.ev) |ev| {
+        _ = cl.c.clReleaseEvent(ev);
+        slot.ev = null;
+    }
+    var c: usize = 0;
+    while (c < C) : (c += 1) {
+        const src = srcps[fi * C + c];
+        std.debug.assert(src.len == @as(usize, d.stride) * d.h_ * wb);
+        var ev: cl.c.cl_event = null;
+        const want_ev = c == C - 1;
+        if (host_opt) |host| {
+            const base = ((c * layers + t_layer) * lay + pad * pp + pad) * wb;
+            var y: usize = 0;
+            while (y < d.h_) : (y += 1) {
+                @memcpy(host[base + y * pp * wb ..][0 .. w * wb], src[y * @as(usize, d.stride) * wb ..][0 .. w * wb]);
+            }
+            if (cl.c.clEnqueueWriteBuffer(s.queue.handle, slot.buf.handle, cl.c.CL_FALSE, c * lay * wb, lay * wb, host.ptr + (c * layers + t_layer) * lay * wb, 0, null, if (want_ev) &ev else null) != cl.c.CL_SUCCESS)
+                return error.EnqueueWrite;
+        } else {
+            const buffer_origin = [3]usize{ pad * wb, c * @as(usize, d.ph) + pad, 0 };
+            const host_origin = [3]usize{ 0, 0, 0 };
+            const region = [3]usize{ w * wb, @as(usize, d.h_), 1 };
+            if (cl.c.clEnqueueWriteBufferRect(s.queue.handle, slot.buf.handle, cl.c.CL_FALSE, &buffer_origin, &host_origin, &region, pp * wb, 0, @as(usize, d.stride) * wb, 0, src.ptr, 0, null, if (want_ev) &ev else null) != cl.c.CL_SUCCESS)
+                return error.EnqueueWrite;
+        }
+        if (want_ev) slot.ev = ev;
+    }
+}
+
+fn process(d: *Data, s: *Stream, dstps: []const []u8, srcps: []const []const u8, refps: ?[]const []const u8, k_start: i32, k_end: i32, win: ?*CacheWin) !void {
     const npix = d.stride * d.h_;
     const C: usize = d.chans;
     const wb: usize = d.wbytes;
@@ -590,8 +668,52 @@ fn process(d: *Data, s: *Stream, dstps: []const []u8, srcps: []const []const u8,
     };
 
     errdefer _ = cl.c.clFinish(s.queue.handle);
-    try uploadWindow(d, s, s.d_u1, s.host, srcps, k_start, k_end);
-    if (refps) |rp| try uploadWindow(d, s, s.d_u1r.?, s.host_r, rp, k_start, k_end);
+
+    if (win) |cw| {
+        const layers = 2 * @as(usize, d.d) + 1;
+        const lay: usize = @as(usize, d.pstride) * @as(usize, d.ph);
+        for (0..cw.n) |e| {
+            if (!cw.load[e]) continue;
+            const slot = &d.cache.slots[cw.idx[e]];
+            const is_ref = e >= cw.count;
+            const fi = if (is_ref) e - cw.count else e;
+            const t_layer: usize = @intCast(@as(i32, @intCast(d.d)) + k_start + @as(i32, @intCast(fi)));
+            try uploadSlot(d, s, slot, if (is_ref) s.host_r else s.host, if (is_ref) refps.? else srcps, fi, t_layer);
+            if (cl.c.clFlush(s.queue.handle) != cl.c.CL_SUCCESS) return error.Flush;
+            cw.published[e] = true;
+            d.cache.publish(cw.idx[e]);
+        }
+        {
+            var hit_evs: [66]cl.c.cl_event = undefined;
+            var n_hit: cl.c.cl_uint = 0;
+            for (0..cw.n) |e| {
+                if (cw.load[e]) continue;
+                if (d.cache.slots[cw.idx[e]].ev) |ev| {
+                    hit_evs[n_hit] = ev;
+                    n_hit += 1;
+                }
+            }
+            if (n_hit > 0) {
+                if (cl.c.clEnqueueBarrierWithWaitList(s.queue.handle, n_hit, &hit_evs, null) != cl.c.CL_SUCCESS)
+                    return error.EnqueueCopy;
+            }
+        }
+        for (0..cw.n) |e| {
+            const is_ref = e >= cw.count;
+            const fi = if (is_ref) e - cw.count else e;
+            const t_layer: usize = @intCast(@as(i32, @intCast(d.d)) + k_start + @as(i32, @intCast(fi)));
+            const buf = if (is_ref) s.d_u1r.? else s.d_u1;
+            const slot = &d.cache.slots[cw.idx[e]];
+            var cc: usize = 0;
+            while (cc < C) : (cc += 1) {
+                if (cl.c.clEnqueueCopyBuffer(s.queue.handle, slot.buf.handle, buf.handle, cc * lay * wb, (cc * layers + t_layer) * lay * wb, lay * wb, 0, null, null) != cl.c.CL_SUCCESS)
+                    return error.EnqueueCopy;
+            }
+        }
+    } else {
+        try uploadWindow(d, s, s.d_u1, s.host, srcps, k_start, k_end);
+        if (refps) |rp| try uploadWindow(d, s, s.d_u1r.?, s.host_r, rp, k_start, k_end);
+    }
 
     try fillF32(s.queue, s.d_u2, 0.0, npix * (C + 1));
     try fillF32(s.queue, s.d_u5, FLT_EPS, npix);
@@ -617,14 +739,27 @@ fn process(d: *Data, s: *Stream, dstps: []const []u8, srcps: []const []const u8,
     }
 
     try ndr(s, s.k_finish, &gws_pix, &lws);
-    var c: usize = 0;
-    while (c < C) : (c += 1) try readBuf(s, s.d_u1z, c * npix * wb, dstps[c]);
-    if (cl.c.clFinish(s.queue.handle) != cl.c.CL_SUCCESS) return error.Finish;
+
+    if (s.host_out) |ho| {
+        var c: usize = 0;
+        while (c < C) : (c += 1) {
+            if (dstps[c].len != npix * wb) return error.PlaneLayoutMismatch;
+        }
+        try readBuf(s, s.d_u1z, 0, ho[0 .. C * npix * wb]);
+        if (cl.c.clFinish(s.queue.handle) != cl.c.CL_SUCCESS) return error.Finish;
+        c = 0;
+        while (c < C) : (c += 1) @memcpy(dstps[c], ho[c * npix * wb ..][0 .. npix * wb]);
+    } else {
+        var c: usize = 0;
+        while (c < C) : (c += 1) try readBuf(s, s.d_u1z, c * npix * wb, dstps[c]);
+        if (cl.c.clFinish(s.queue.handle) != cl.c.CL_SUCCESS) return error.Finish;
+    }
 }
 
 fn getFrame(n: c_int, ar: vs.ActivationReason, instance_data: ?*anyopaque, _: ?*?*anyopaque, frame_ctx: ?*vs.FrameContext, core_ptr: ?*vs.Core, vsapi: ?*const vs.API) callconv(.c) ?*const vs.Frame {
     const d: *Data = @ptrCast(@alignCast(instance_data));
     const zapi = ZAPI.init(vsapi, core_ptr, frame_ctx);
+
     const dd: i32 = @intCast(d.d);
     const ni: i32 = @intCast(n);
     const nf: i32 = @intCast(d.vi.numFrames);
@@ -711,7 +846,34 @@ fn getFrame(n: c_int, ar: vs.ActivationReason, instance_data: ?*anyopaque, _: ?*
         const s = d.pool.acquire();
         defer d.pool.release(s);
 
-        process(d, s, dstps, srcps, refps, k_start, k_end) catch |err| {
+        var win = CacheWin{};
+        if (d.use_cache) {
+            var e: usize = 0;
+            var kk: i32 = k_start;
+            while (kk <= k_end) : (kk += 1) {
+                win.keys[e] = @intCast(@min(@max(ni + kk, 0), nf - 1));
+                e += 1;
+            }
+            win.count = e;
+            if (d.ref_node != null) {
+                kk = k_start;
+                while (kk <= k_end) : (kk += 1) {
+                    win.keys[e] = (@as(i64, 1) << 40) | @as(i64, @intCast(@min(@max(ni + kk, 0), nf - 1)));
+                    e += 1;
+                }
+            }
+            win.n = e;
+            @memset(win.published[0..win.n], false);
+            d.cache.acquire(win.keys[0..win.n], win.idx[0..win.n], win.load[0..win.n]);
+        }
+        defer if (d.use_cache) {
+            for (0..win.n) |e| {
+                if (win.load[e] and !win.published[e]) d.cache.abandon(win.idx[e]);
+            }
+            d.cache.release(win.idx[0..win.n]);
+        };
+
+        process(d, s, dstps, srcps, refps, k_start, k_end, if (d.use_cache) &win else null) catch |err| {
             zapi.setFilterError("NLMeans: process failed.");
             std.log.err("NLMeans process failed: {}", .{err});
             dst.deinit();
@@ -725,6 +887,7 @@ fn getFrame(n: c_int, ar: vs.ActivationReason, instance_data: ?*anyopaque, _: ?*
 fn free(instance_data: ?*anyopaque, _: ?*vs.Core, vsapi: ?*const vs.API) callconv(.c) void {
     const d: *Data = @ptrCast(@alignCast(instance_data));
     d.pool.deinit();
+    d.cache.deinit();
     d.context.release();
     freeTables(d);
     vsapi.?.freeNode.?(d.node);
@@ -772,6 +935,7 @@ pub fn create(in: ?*const vs.Map, out: ?*vs.Map, _: ?*anyopaque, core_ptr: ?*vs.
     d.wref = map_in.getValue(f32, "wref") orelse 1.0;
     const chstr = map_in.getData("channels", 0) orelse "auto";
     const ns_req = map_in.getValue(i32, "num_streams");
+
     if (dd < 0 or dd > 16) return map_out.setError("NLMeans: d must be 0..16.");
     if (map_in.getNodeVi("rclip")) |rv| {
         d.ref_node = rv[0];
@@ -859,17 +1023,20 @@ pub fn create(in: ?*const vs.Map, out: ?*vs.Map, _: ?*anyopaque, core_ptr: ?*vs.
     d.pad = @intCast(a);
     d.pstride = @intCast(vsh.ceilN(@as(usize, d.w) + 2 * @as(usize, d.pad), 8));
     d.ph = d.h_ + 2 * d.pad;
+
     vszipcl.initContext(&d, @intCast(device_id)) catch |err| {
         map_out.setError(if (err == error.InvalidDeviceID) "NLMeans: invalid device ID." else "NLMeans: OpenCL init failed.");
         std.log.err("NLMeans OpenCL init failed: {}", .{err});
         return;
     };
+
     d.qb = if (@as(u64, d.stride) * @as(u64, d.h_) <= 1920 * 1152) nlm_qb_small else nlm_qb_large;
     var pin_min: usize = 2;
+    var cache_req: bool = true;
     {
         var terr: ?[:0]const u8 = null;
         if (map_in.numElements("tune")) |n| {
-            if (n > tune_len) terr = "NLMeans: tune expects at most 5 entries [blk_x, blk_y, vrt, qb, pin_min_streams].";
+            if (n > tune_len) terr = "NLMeans: tune expects at most 6 entries [blk_x, blk_y, vrt, qb, pin_min_streams, cache].";
         }
         if (vszipcl.tuneEntry(map_in, 0)) |v| {
             if (v < 1 or v > 64) terr = "NLMeans: tune[0] (blk_x) must be 1..64." else d.blk_x = @intCast(v);
@@ -885,6 +1052,9 @@ pub fn create(in: ?*const vs.Map, out: ?*vs.Map, _: ?*anyopaque, core_ptr: ?*vs.
         }
         if (vszipcl.tuneEntry(map_in, 4)) |v| {
             if (v < 1 or v > 33) terr = "NLMeans: tune[4] (pin_min_streams) must be 1..33." else pin_min = @intCast(v);
+        }
+        if (vszipcl.tuneEntry(map_in, 5)) |v| {
+            if (v > 1) terr = "NLMeans: tune[5] (cache) must be 0 or 1." else cache_req = v != 0;
         }
         if (d.blk_x * d.blk_y > vszipcl.deviceMaxWG(d.device)) terr = "NLMeans: tune blk_x*blk_y exceeds the device max work-group size.";
         if (terr == null) {
@@ -960,6 +1130,55 @@ pub fn create(in: ?*const vs.Map, out: ?*vs.Map, _: ?*anyopaque, core_ptr: ?*vs.
         keep = false;
         return;
     };
+
+    data.use_cache = data.d > 0 and cache_req;
+    data.slot_bytes = @as(usize, data.chans) * (@as(usize, data.pstride) * @as(usize, data.ph)) * @as(usize, data.wbytes);
+    if (data.use_cache) blk: {
+        var core_info: vs.CoreInfo = undefined;
+        vsapi.?.getCoreInfo.?(core_ptr, &core_info);
+        const n_threads: usize = @intCast(@max(core_info.numThreads, 1));
+        const tw: usize = 2 * @as(usize, data.d) + 1;
+        const n_clips: usize = if (data.has_ref) 2 else 1;
+        const min_slots = n_clips * tw;
+        const want = min_slots + @max(streams, n_threads) + 2 * @as(usize, data.d);
+
+        const q = cl.createCommandQueue(data.context, data.device, .{}) catch {
+            data.use_cache = false;
+            break :blk;
+        };
+        defer q.release();
+        const slots = allocator.alloc(clframecache.CacheSlot, want) catch {
+            data.use_cache = false;
+            break :blk;
+        };
+        var n_ok: usize = 0;
+        for (slots) |*slot| {
+            slot.* = .{};
+            slot.buf = cl.createBuffer(u8, data.context, .{ .read_write = true }, data.slot_bytes) catch break;
+            slot.has_buf = true;
+            fillZero(q, slot.buf, data.slot_bytes) catch {
+                slot.buf.release();
+                slot.has_buf = false;
+                break;
+            };
+            n_ok += 1;
+        }
+        const fills_ok = cl.c.clFinish(q.handle) == cl.c.CL_SUCCESS;
+        if (!fills_ok or n_ok < min_slots) {
+            var i: usize = 0;
+            while (i < n_ok) : (i += 1) slots[i].buf.release();
+            allocator.free(slots);
+            data.use_cache = false;
+            std.log.warn("vszipcl NLMeans: not enough device memory for the source cache; running uncached.", .{});
+        } else {
+            data.cache.slots = if (n_ok == want) slots else blk2: {
+                const shrunk = allocator.realloc(slots, n_ok) catch slots[0..n_ok];
+                break :blk2 shrunk;
+            };
+            if (n_ok < want)
+                std.log.warn("vszipcl NLMeans: source cache shrunk to {d}/{d} slots (low device memory).", .{ n_ok, want });
+        }
+    }
 
     const rp: vs.RequestPattern = if (d.d > 0) .General else .StrictSpatial;
     var dep = [_]vs.FilterDependency{

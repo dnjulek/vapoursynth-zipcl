@@ -13,7 +13,8 @@ const allocator = std.heap.c_allocator;
 
 const FLT_EPSILON: f32 = 1.19209290e-7;
 
-const tune_len = 4;
+const tune_len = 5;
+
 const Config = struct {
     radius: i32,
     w: i32,
@@ -28,36 +29,47 @@ const Data = struct {
     node: ?*vs.Node,
     ref_node: ?*vs.Node,
     vi: *const vs.VideoInfo,
+
     sig_sp_scaled: [3]f32,
     sig_col_scaled: [3]f32,
     radius: [3]i32,
     process: [3]bool,
+
     configs: [3]Config,
     n_cfg: usize,
     plane_cfg: [3]usize,
+
     has_ref: bool,
     use_shared_memory: bool,
+
     blk_x: usize,
     blk_y: usize,
     smem_budget: usize,
     use_pinned: bool,
+    bake: bool,
     conv_wg: usize,
+
     bits: i32,
     half: bool,
     bytes: u32,
+
     platform: cl.Platform,
     device: cl.Device,
     context: cl.Context,
+
     buff_src: usize,
     buff_dst: usize,
+
     stage_off: [3]usize,
     stage_elems: [3]usize,
     buff_stage: usize,
+
     pool: clpool.Pool(Stream, Data),
 };
 
 const Stream = struct {
-    program: cl.Program,
+    programs: [3]cl.Program,
+    n_prog: usize,
     kernels: [3]cl.Kernel,
     n_kern: usize,
     cin: [3]cl.Kernel,
@@ -77,8 +89,8 @@ const Stream = struct {
         self.n_cin = 0;
         self.n_cout = 0;
         self.has_raw = false;
-        self.program = try cl.createProgramWithSource(d.context, kernel_src);
-        errdefer self.program.release();
+        self.n_prog = 0;
+        errdefer self.releasePrograms();
         var blk_buf: [64]u8 = undefined;
         const blk_opt: []const u8 = if (d.blk_x != 16 or d.blk_y != 8)
             std.fmt.bufPrint(&blk_buf, " -DBLOCK_X={d} -DBLOCK_Y={d}", .{ d.blk_x, d.blk_y }) catch unreachable
@@ -89,16 +101,28 @@ const Stream = struct {
             std.fmt.bufPrint(&cw_buf, " -DCONV_WG={d}", .{d.conv_wg}) catch unreachable
         else
             "";
-        const opts = try std.fmt.allocPrintSentinel(allocator, "-cl-std=CL1.2 -DHAS_REF={d} -DBITS={d} -DHALF={d}{s}{s}", .{ @intFromBool(d.has_ref), d.bits, @intFromBool(d.half), blk_opt, cw_opt }, 0);
-        defer allocator.free(opts);
-        self.program.build(&.{d.device}, opts) catch |err| {
-            if (err == error.BuildProgramFailure) {
-                const log = try self.program.getBuildLog(allocator, d.device);
-                defer allocator.free(log);
-                std.log.err("Bilateral OpenCL build failed: {s}", .{log});
-            }
-            return err;
-        };
+        const n_progs: usize = if (d.bake) d.n_cfg else 1;
+        var pi: usize = 0;
+        while (pi < n_progs) : (pi += 1) {
+            var bake_buf: [96]u8 = undefined;
+            const bake_opt: []const u8 = if (d.bake) blk: {
+                const cfg = d.configs[pi];
+                break :blk std.fmt.bufPrint(&bake_buf, " -DBAKE_W={d} -DBAKE_H={d} -DBAKE_S={d} -DBAKE_R={d}", .{ cfg.w, cfg.h, cfg.stride, cfg.radius }) catch unreachable;
+            } else "";
+            const opts = try std.fmt.allocPrintSentinel(allocator, "-cl-std=CL1.2 -DHAS_REF={d} -DBITS={d} -DHALF={d}{s}{s}{s}", .{ @intFromBool(d.has_ref), d.bits, @intFromBool(d.half), blk_opt, cw_opt, bake_opt }, 0);
+            defer allocator.free(opts);
+            const prog = try cl.createProgramWithSource(d.context, kernel_src);
+            self.programs[pi] = prog;
+            self.n_prog = pi + 1;
+            prog.build(&.{d.device}, opts) catch |err| {
+                if (err == error.BuildProgramFailure) {
+                    const log = try prog.getBuildLog(allocator, d.device);
+                    defer allocator.free(log);
+                    std.log.err("Bilateral OpenCL build failed: {s}", .{log});
+                }
+                return err;
+            };
+        }
         self.queue = try cl.createCommandQueue(d.context, d.device, .{});
         errdefer self.queue.release();
         self.src = try cl.createBuffer(f32, d.context, .{ .read_only = true }, d.buff_src);
@@ -140,7 +164,7 @@ const Stream = struct {
 
         errdefer self.releaseKernels();
         for (d.configs[0..d.n_cfg], 0..) |cfg, ci| {
-            const k = try cl.createKernel(self.program, if (cfg.use_sm) "bilateral_sm" else "bilateral_gl");
+            const k = try cl.createKernel(self.programs[if (d.bake) ci else 0], if (cfg.use_sm) "bilateral_sm" else "bilateral_gl");
             self.kernels[ci] = k;
             errdefer k.release();
             try k.setArg(@TypeOf(self.dst), 0, self.dst);
@@ -165,7 +189,7 @@ const Stream = struct {
                 const n_out: usize = @as(usize, @intCast(cfg.h)) * @as(usize, @intCast(cfg.stride));
                 const n_in: usize = (1 + @as(usize, @intFromBool(d.has_ref))) * n_out;
                 {
-                    const kin = try cl.createKernel(self.program, "convert_in");
+                    const kin = try cl.createKernel(self.programs[0], "convert_in");
                     self.cin[ci] = kin;
                     errdefer kin.release();
                     try kin.setArg(@TypeOf(self.src), 0, self.src);
@@ -174,7 +198,7 @@ const Stream = struct {
                     self.n_cin = ci + 1;
                 }
                 {
-                    const kout = try cl.createKernel(self.program, "convert_out");
+                    const kout = try cl.createKernel(self.programs[0], "convert_out");
                     self.cout[ci] = kout;
                     errdefer kout.release();
                     try kout.setArg(@TypeOf(self.raw), 0, self.raw);
@@ -184,6 +208,15 @@ const Stream = struct {
                 }
             }
         }
+    }
+
+    fn releasePrograms(self: *Stream) void {
+        var i = self.n_prog;
+        while (i > 0) {
+            i -= 1;
+            self.programs[i].release();
+        }
+        self.n_prog = 0;
     }
 
     fn releaseKernels(self: *Stream) void {
@@ -216,7 +249,7 @@ const Stream = struct {
         self.dst.release();
         self.src.release();
         self.queue.release();
-        self.program.release();
+        self.releasePrograms();
     }
 };
 
@@ -279,11 +312,23 @@ const kernel_src =
     \\}
     \\#endif
     \\
+    \\#ifdef BAKE_W
+    \\#define width  (BAKE_W)
+    \\#define height (BAKE_H)
+    \\#define stride (BAKE_S)
+    \\#define radius (BAKE_R)
+    \\#define GEOM_ARGS const int width_a, const int height_a, const int stride_a
+    \\#define RAD_ARG   const int radius_a
+    \\#else
+    \\#define GEOM_ARGS const int width, const int height, const int stride
+    \\#define RAD_ARG   const int radius
+    \\#endif
+    \\
     \\__kernel __attribute__((reqd_work_group_size(BLOCK_X, BLOCK_Y, 1)))
     \\void bilateral_sm(
     \\    __global float *restrict dst, __global const float *restrict src,
-    \\    const int width, const int height, const int stride,
-    \\    const float sigma_spatial_scaled, const float sigma_color_scaled, const int radius,
+    \\    GEOM_ARGS,
+    \\    const float sigma_spatial_scaled, const float sigma_color_scaled, RAD_ARG,
     \\    __local float *buffer)
     \\{
     \\    const int tx = get_local_id(0);
@@ -343,8 +388,8 @@ const kernel_src =
     \\__kernel __attribute__((reqd_work_group_size(BLOCK_X, BLOCK_Y, 1)))
     \\void bilateral_gl(
     \\    __global float *restrict dst, __global const float *restrict src,
-    \\    const int width, const int height, const int stride,
-    \\    const float sigma_spatial_scaled, const float sigma_color_scaled, const int radius)
+    \\    GEOM_ARGS,
+    \\    const float sigma_spatial_scaled, const float sigma_color_scaled, RAD_ARG)
     \\{
     \\    const int x = get_global_id(0);
     \\    const int y = get_global_id(1);
@@ -383,8 +428,18 @@ const ndr = vszipcl.ndr;
 fn writeBuf(s: *Stream, mem: cl.c.cl_mem, src: []const u8) !void {
     return vszipcl.enqWrite(s.queue, mem, 0, src);
 }
+
 fn readBuf(s: *Stream, mem: cl.c.cl_mem, dst: []u8) !void {
     return vszipcl.enqRead(s.queue, mem, 0, dst);
+}
+
+fn ungate(s: *Stream) !void {
+    var mev: cl.c.cl_event = null;
+    if (cl.c.clEnqueueMarkerWithWaitList(s.queue.handle, 0, null, &mev) != cl.c.CL_SUCCESS) return error.EnqueueKernel;
+    _ = cl.c.clFlush(s.queue.handle);
+    const werr = cl.c.clWaitForEvents(1, &mev);
+    _ = cl.c.clReleaseEvent(mev);
+    if (werr != cl.c.CL_SUCCESS) return error.Finish;
 }
 
 fn process(d: *Data, s: *Stream, src: ZFrame, ref: ?ZFrame, dst: ZFrameW) !void {
@@ -395,6 +450,7 @@ fn process(d: *Data, s: *Stream, src: ZFrame, ref: ?ZFrame, dst: ZFrameW) !void 
     var p: u32 = 0;
     while (p < numPlanes) : (p += 1) {
         if (!d.process[p]) continue;
+
         const cfg = d.configs[d.plane_cfg[p]];
         std.debug.assert(src.getStride2(u8, p) == @as(u32, @intCast(cfg.stride)) * d.bytes);
         std.debug.assert(src.getHeightSigned(p) == cfg.h);
@@ -421,10 +477,12 @@ fn process(d: *Data, s: *Stream, src: ZFrame, ref: ?ZFrame, dst: ZFrameW) !void 
             try ndr(s, s.cin[ci], &.{vszipcl.ceilTo(n_in, d.conv_wg)}, &lws1);
             try ndr(s, s.kernels[ci], &gws, &lws);
             try ndr(s, s.cout[ci], &.{vszipcl.ceilTo(n_out, d.conv_wg)}, &lws1);
+            try ungate(s);
             try readBuf(s, s.raw.handle, reg[0..plane_bytes]);
         } else {
             try writeBuf(s, s.src.handle, reg);
             try ndr(s, s.kernels[ci], &gws, &lws);
+            try ungate(s);
             try readBuf(s, s.dst.handle, reg[0..plane_bytes]);
         }
     }
@@ -456,6 +514,7 @@ fn getFrame(n: c_int, activation_reason: vs.ActivationReason, instance_data: ?*a
         defer if (ref) |r| r.deinit();
 
         const dst = src.newVideoFrame();
+
         const numPlanes: u32 = @intCast(d.vi.format.numPlanes);
         var p: u32 = 0;
         while (p < numPlanes) : (p += 1) {
@@ -506,11 +565,13 @@ pub fn create(in: ?*const vs.Map, out: ?*vs.Map, _: ?*anyopaque, core: ?*vs.Core
     d.node, d.vi = map_in.getNodeVi("clip").?;
     d.ref_node = map_in.getNode("ref");
     d.has_ref = d.ref_node != null;
+
     var keep = false;
     defer if (!keep) {
         zapi.freeNode(d.ref_node);
         zapi.freeNode(d.node);
     };
+
     const fmt = d.vi.format;
     const bits: i32 = fmt.bitsPerSample;
     const depth_ok = (fmt.sampleType == .Float and (bits == 32 or bits == 16)) or
@@ -598,6 +659,7 @@ pub fn create(in: ?*const vs.Map, out: ?*vs.Map, _: ?*anyopaque, core: ?*vs.Core
     };
 
     d.use_shared_memory = (map_in.getValue(i32, "use_shared_memory") orelse 1) != 0;
+
     const strides = vszipcl.strideFromVi(d.vi);
     const luma_stride: usize = strides[0];
     const luma_h: usize = @intCast(d.vi.height);
@@ -628,15 +690,17 @@ pub fn create(in: ?*const vs.Map, out: ?*vs.Map, _: ?*anyopaque, core: ?*vs.Core
         std.log.err("Bilateral OpenCL init failed: {}", .{err});
         return;
     };
+
     d.blk_x = 16;
     d.blk_y = 8;
     d.smem_budget = @min(@as(usize, 48 * 1024), vszipcl.deviceLocalMemSize(d.device));
     d.use_pinned = true;
+    d.bake = true;
     d.conv_wg = @min(@as(usize, 256), vszipcl.deviceMaxWG(d.device));
     {
         var terr: ?[:0]const u8 = null;
         if (map_in.numElements("tune")) |n| {
-            if (n > tune_len) terr = "Bilateral: tune expects at most 4 entries [blk_x, blk_y, smem_kib, pinned].";
+            if (n > tune_len) terr = "Bilateral: tune expects at most 5 entries [blk_x, blk_y, smem_kib, pinned, bake].";
         }
         if (vszipcl.tuneEntry(map_in, 0)) |v| {
             if (v < 1 or v > 64) terr = "Bilateral: tune[0] (blk_x) must be 1..64." else d.blk_x = @intCast(v);
@@ -650,6 +714,9 @@ pub fn create(in: ?*const vs.Map, out: ?*vs.Map, _: ?*anyopaque, core: ?*vs.Core
         if (vszipcl.tuneEntry(map_in, 3)) |v| {
             if (v > 1) terr = "Bilateral: tune[3] (pinned) must be 0 or 1." else d.use_pinned = v != 0;
         }
+        if (vszipcl.tuneEntry(map_in, 4)) |v| {
+            if (v > 1) terr = "Bilateral: tune[4] (bake) must be 0 or 1." else d.bake = v != 0;
+        }
         if (d.blk_x * d.blk_y > vszipcl.deviceMaxWG(d.device)) terr = "Bilateral: tune blk_x*blk_y exceeds the device max work-group size.";
         if (terr) |msg| {
             map_out.setError(msg);
@@ -657,6 +724,7 @@ pub fn create(in: ?*const vs.Map, out: ?*vs.Map, _: ?*anyopaque, core: ?*vs.Core
             return;
         }
     }
+
     d.n_cfg = 0;
     {
         var pi: usize = 0;
@@ -686,6 +754,7 @@ pub fn create(in: ?*const vs.Map, out: ?*vs.Map, _: ?*anyopaque, core: ?*vs.Core
     }
 
     d.pool = .{};
+
     const data: *Data = allocator.create(Data) catch unreachable;
     data.* = d;
 
@@ -707,5 +776,6 @@ pub fn create(in: ?*const vs.Map, out: ?*vs.Map, _: ?*anyopaque, core: ?*vs.Core
         .{ .source = d.ref_node, .requestPattern = .StrictSpatial },
     };
     const deps: []const vs.FilterDependency = if (d.has_ref) dep[0..2] else dep[0..1];
+
     zapi.createVideoFilter(out, "Bilateral", d.vi, getFrame, free, .Parallel, deps, data);
 }

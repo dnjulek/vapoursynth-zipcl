@@ -13,7 +13,8 @@ const allocator = std.heap.c_allocator;
 
 const mdis_max = 40;
 const tpitch_max = 2 * mdis_max + 1;
-const tune_len = 4;
+
+const tune_len = 5;
 
 const kernel_src =
     \\#define TPMAX 85  /* tpitch_max + 4 sentinels (2 per side; K=2 fused DP reads tid..tid+4) */
@@ -921,13 +922,43 @@ const Data = struct {
     is_nv: bool = false,
     local_mem: usize = 32 * 1024,
     bx: u32 = 48,
-    run: u32 = 8,
+    run: u32 = 16,
     run_hp: u32 = 4,
+
     pad: u32 = 0,
+
     platform: cl.Platform = undefined,
     device: cl.Device = undefined,
     context: cl.Context = undefined,
     pool: clpool.Pool(Stream, Data) = .{},
+
+    spool: clpool.Pool(SrcStage, Data) = .{},
+    use_spool: bool = true,
+    stage_cap: usize = 1,
+};
+
+const SrcStage = struct {
+    queue: cl.CommandQueue,
+    buf: cl.Buffer(u8),
+    host: []u8,
+
+    pub fn init(self: *SrcStage, d: *Data) !void {
+        self.queue = try cl.createCommandQueue(d.context, d.device, .{});
+        errdefer self.queue.release();
+        self.buf = try cl.createBuffer(u8, d.context, .{ .alloc_host_ptr = true }, d.stage_cap);
+        errdefer self.buf.release();
+        var map_err: cl.c.cl_int = cl.c.CL_SUCCESS;
+        const map_ptr = cl.c.clEnqueueMapBuffer(self.queue.handle, self.buf.handle, cl.c.CL_TRUE, cl.c.CL_MAP_READ | cl.c.CL_MAP_WRITE, 0, d.stage_cap, 0, null, null, &map_err);
+        if (map_err != cl.c.CL_SUCCESS or map_ptr == null) return error.MapStaging;
+        self.host = @as([*]u8, @ptrCast(map_ptr.?))[0..d.stage_cap];
+    }
+
+    pub fn deinit(self: *SrcStage) void {
+        _ = cl.c.clEnqueueUnmapMemObject(self.queue.handle, self.buf.handle, self.host.ptr, 0, null, null);
+        _ = cl.c.clFinish(self.queue.handle);
+        self.buf.release();
+        self.queue.release();
+    }
 };
 
 const Stream = struct {
@@ -968,7 +999,7 @@ const Stream = struct {
             std.fmt.bufPrint(&run_buf, " -DRUN={d} -DRUN_HP={d}", .{ d.run, d.run_hp }) catch unreachable
         else
             "";
-        const nv_opt: []const u8 = if (d.is_nv) " -cl-nv-maxrregcount=96" else "";
+        const nv_opt: []const u8 = if (d.is_nv and d.hp) " -cl-nv-maxrregcount=96" else "";
         const vc_wg: usize = @min(@as(usize, 1024), d.max_wg);
         const build_opts = try std.fmt.allocPrintSentinel(allocator, "-cl-std=CL1.2 -DCN={d} -DMDIS={d} -DBX={d} -DBITS={d} -DHALF={d} -DVC_WG={d}{s}{s}", .{ d.nrad, d.mdis, bx, d.bits, @intFromBool(d.half), vc_wg, run_opt, nv_opt }, 0);
         defer allocator.free(build_opts);
@@ -1212,6 +1243,7 @@ const ndr = vszipcl.ndr;
 fn writeBuf(comptime T: type, s: *Stream, buf: cl.Buffer(T), src: []const T) !void {
     return vszipcl.enqWrite(s.queue, buf.handle, 0, std.mem.sliceAsBytes(src));
 }
+
 fn readBuf(comptime T: type, s: *Stream, buf: cl.Buffer(T), dst: []T) !void {
     return vszipcl.enqRead(s.queue, buf.handle, 0, std.mem.sliceAsBytes(dst));
 }
@@ -1219,6 +1251,7 @@ fn readBuf(comptime T: type, s: *Stream, buf: cl.Buffer(T), dst: []T) !void {
 fn processPlane(d: *Data, s: *Stream, ci: usize, plane: usize, srcp: []const u8, scpp: ?[]const u8, field: u8) !void {
     const cfg = &d.configs[ci];
     const n_interp: u32 = (cfg.dst_h - field + 1) / 2;
+
     errdefer _ = cl.c.clFinish(s.queue.handle);
 
     const use_reg = d.vcheck > 0;
@@ -1345,16 +1378,44 @@ fn getFrame(n: c_int, ar: vs.ActivationReason, instance_data: ?*anyopaque, _: ?*
         }
         if (d.field > 1) field = @as(u8, @intCast(n & 1)) ^ field;
 
+        const nplanes: u32 = @intCast(d.vi.format.numPlanes);
+
+        const stg: ?*SrcStage = if (d.use_spool) d.spool.acquire() else null;
+        defer if (stg) |g| d.spool.release(g);
+        var src_sl: [3][]const u8 = undefined;
+        var scp_sl: [3]?[]const u8 = .{ null, null, null };
+        {
+            var off: usize = 0;
+            var pl: u32 = 0;
+            while (pl < nplanes) : (pl += 1) {
+                const sp = src.getReadSlice(pl);
+                if (stg != null and off + sp.len <= stg.?.host.len) {
+                    const g = stg.?;
+                    @memcpy(g.host[off..][0..sp.len], sp);
+                    src_sl[pl] = g.host[off..][0..sp.len];
+                    off += sp.len;
+                } else src_sl[pl] = sp;
+                if (scp) |sc| {
+                    const cp = sc.getReadSlice(pl);
+                    if (stg != null and off + cp.len <= stg.?.host.len) {
+                        const g = stg.?;
+                        @memcpy(g.host[off..][0..cp.len], cp);
+                        scp_sl[pl] = g.host[off..][0..cp.len];
+                        off += cp.len;
+                    } else scp_sl[pl] = cp;
+                }
+            }
+        }
+
         const s = d.pool.acquire();
         defer d.pool.release(s);
 
-        const nplanes: u32 = @intCast(d.vi.format.numPlanes);
         var failed = false;
         var plane: u32 = 0;
         while (plane < nplanes and !failed) : (plane += 1) {
             const ci = d.plane_cfg[plane];
-            const srcp = src.getReadSlice(plane);
-            const scpp: ?[]const u8 = if (scp) |sc| sc.getReadSlice(plane) else null;
+            const srcp = src_sl[plane];
+            const scpp: ?[]const u8 = scp_sl[plane];
             std.debug.assert(src.getStride2(u8, plane) ==
                 (if (d.horizontal) d.configs[ci].in_stride else d.configs[ci].stride) * d.bytes);
             processPlane(d, s, ci, plane, srcp, scpp, field) catch |err| {
@@ -1410,6 +1471,7 @@ fn getFrame(n: c_int, ar: vs.ActivationReason, instance_data: ?*anyopaque, _: ?*
 fn free(instance_data: ?*anyopaque, _: ?*vs.Core, vsapi: ?*const vs.API) callconv(.c) void {
     const d: *Data = @ptrCast(@alignCast(instance_data));
     d.pool.deinit();
+    d.spool.deinit();
     d.context.release();
     freeStencilTables(d);
     vsapi.?.freeNode.?(d.node);
@@ -1429,6 +1491,7 @@ fn freeStencilTables(d: *Data) void {
 pub fn createEEDI3(in: ?*const vs.Map, out: ?*vs.Map, ud: ?*anyopaque, core_ptr: ?*vs.Core, vsapi: ?*const vs.API) callconv(.c) void {
     createImpl(in, out, ud, core_ptr, vsapi, false);
 }
+
 pub fn createEEDI3H(in: ?*const vs.Map, out: ?*vs.Map, ud: ?*anyopaque, core_ptr: ?*vs.Core, vsapi: ?*const vs.API) callconv(.c) void {
     createImpl(in, out, ud, core_ptr, vsapi, true);
 }
@@ -1476,6 +1539,7 @@ fn createImpl(in: ?*const vs.Map, out: ?*vs.Map, _: ?*anyopaque, core_ptr: ?*vs.
     d.dh = map_in.getBool("dh") orelse false;
     d.hp = map_in.getBool("hp") orelse false;
     const ns_req = map_in.getValue(i32, "num_streams");
+
     const interp_axis: i32 = if (horizontal) d.vi.width else d.vi.height;
 
     if (field < 0 or field > 3) return map_out.setError("EEDI3: field must be 0..3.");
@@ -1643,13 +1707,13 @@ fn createImpl(in: ?*const vs.Map, out: ?*vs.Map, _: ?*anyopaque, core_ptr: ?*vs.
     };
 
     d.bx = 48;
-    d.run = 8;
+    d.run = if (d.mdis <= 20) 8 else 16;
     d.run_hp = 4;
     var lws_floor: usize = 128;
     {
         var terr: ?[:0]const u8 = null;
         if (map_in.numElements("tune")) |n| {
-            if (n > tune_len) terr = "EEDI3: tune expects at most 4 entries [bx, run, run_hp, lws_floor].";
+            if (n > tune_len) terr = "EEDI3: tune expects at most 5 entries [bx, run, run_hp, lws_floor, spool].";
         }
         if (vszipcl.tuneEntry(map_in, 0)) |v| {
             if (v < 8 or v > 256) terr = "EEDI3: tune[0] (bx) must be 8..256." else d.bx = @intCast(v);
@@ -1662,6 +1726,9 @@ fn createImpl(in: ?*const vs.Map, out: ?*vs.Map, _: ?*anyopaque, core_ptr: ?*vs.
         }
         if (vszipcl.tuneEntry(map_in, 3)) |v| {
             if (v < 32 or v > 1024) terr = "EEDI3: tune[3] (lws_floor) must be 32..1024." else lws_floor = @intCast(v);
+        }
+        if (vszipcl.tuneEntry(map_in, 4)) |v| {
+            if (v > 1) terr = "EEDI3: tune[4] (spool) must be 0 or 1." else d.use_spool = v != 0;
         }
         if (terr == null and (d.bx % d.run != 0 or d.bx % d.run_hp != 0))
             terr = "EEDI3: tune bx must be a multiple of both run and run_hp.";
@@ -1702,6 +1769,19 @@ fn createImpl(in: ?*const vs.Map, out: ?*vs.Map, _: ?*anyopaque, core_ptr: ?*vs.
         freeStencilTables(&d);
         return;
     }
+
+    {
+        const npl: usize = @intCast(d.vi.format.numPlanes);
+        var cap: usize = 0;
+        for (0..npl) |p| {
+            const cfg = &d.configs[d.plane_cfg[p]];
+            cap += @as(usize, if (horizontal) cfg.in_stride * cfg.in_h else cfg.stride * cfg.src_h) * d.bytes;
+            if (d.vcheck > 0 and d.sclip != null)
+                cap += @as(usize, if (horizontal) cfg.out_stride * cfg.in_h else cfg.stride * cfg.dst_h) * d.bytes;
+        }
+        d.stage_cap = @max(cap, 1);
+    }
+
     const data: *Data = allocator.create(Data) catch unreachable;
     data.* = d;
     keep = true;
@@ -1718,6 +1798,16 @@ fn createImpl(in: ?*const vs.Map, out: ?*vs.Map, _: ?*anyopaque, core_ptr: ?*vs.
         keep = false;
         return;
     };
+    if (data.use_spool) {
+        const n_stage = streams + 3;
+        data.spool.prime(data, n_stage);
+        data.spool.prewarm(n_stage) catch |err| {
+            std.log.warn("EEDI3: pinned upload staging unavailable ({t}); falling back to pageable uploads.", .{err});
+            data.spool.deinit();
+            data.spool = .{};
+            data.use_spool = false;
+        };
+    }
 
     var dep_buf: [2]vs.FilterDependency = undefined;
     dep_buf[0] = .{ .source = d.node, .requestPattern = if (d.field > 1) .General else .StrictSpatial };

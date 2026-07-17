@@ -12,7 +12,9 @@ const ZAPI = vapoursynth.ZAPI;
 const allocator = std.heap.c_allocator;
 
 const max_iterations: i32 = 32;
-const tune_len = 2;
+
+const tune_len = 3;
+
 const dlut_sizeb = 6;
 const dlut_size = 1 << dlut_sizeb;
 const dlut_len = dlut_size * dlut_size;
@@ -31,6 +33,7 @@ const libm = struct {
 };
 
 const u64_max_f: f64 = 18446744073709551616.0;
+
 const bn_radius = dlut_size / 2 - 1;
 const bn_middle = bn_radius | (bn_radius << dlut_sizeb);
 const bn_gsize = bn_radius * 2 + 1;
@@ -152,6 +155,7 @@ const Data = struct {
     platform: cl.Platform,
     device: cl.Device,
     context: cl.Context,
+
     pw: [3]i32,
     ph: [3]i32,
     pstride: [3]i32,
@@ -160,55 +164,81 @@ const Data = struct {
     rank_plane: [3]i32,
     n_proc: i32,
 
+    off_reg: [3]usize,
     buff_size: usize,
     bits: i32,
     half: bool,
     bytes: u32,
 
-    iterations: i32,
-    threshold_s: f32,
-    radius: f32,
-    grain_s: f32,
-    grain_on: bool,
+    use_pinned: bool,
+    memcpy_sem: std.Io.Semaphore,
+
+    iterations: [3]i32,
+    threshold_s: [3]f32,
+    radius: [3]f32,
+    grain_s: [3]f32,
+    grain_on: [3]bool,
+    fused: bool,
+    n_prog: usize,
+    plane_prog: [3]usize,
+    prog_iter: [3]i32,
+    prog_grain: [3]bool,
 
     dither_on: bool,
     dmode: i32,
     dlut: ?[]f32,
+
     blk_x: usize,
     blk_y: usize,
 
+    gws_w: usize,
+    gws_h: usize,
+
     pool: clpool.Pool(Stream, Data),
+
 };
 
 const Stream = struct {
-    program: cl.Program,
+    programs: [3]cl.Program,
+    n_prog: usize,
     queue: cl.CommandQueue,
     src: cl.Buffer(u8),
     dst: cl.Buffer(u8),
+    geom: cl.Buffer(i32),
     dlut: ?cl.Buffer(f32),
-    kernels: [3]cl.Kernel,
+    stage: ?cl.Buffer(u8),
+    host: []u8,
+    kerns: [3]cl.Kernel,
     n_kern: usize,
 
     pub fn init(self: *Stream, d: *Data) !void {
+        self.n_prog = 0;
         self.n_kern = 0;
         self.dlut = null;
-        self.program = try cl.createProgramWithSource(d.context, deband_src);
-        errdefer self.program.release();
+        self.stage = null;
+        errdefer {
+            var m: usize = 0;
+            while (m < self.n_prog) : (m += 1) self.programs[m].release();
+        }
         var blk_buf: [48]u8 = undefined;
         const blk_opt: []const u8 = if (d.blk_x != 16 or d.blk_y != 8)
             std.fmt.bufPrint(&blk_buf, " -DDB_BX={d} -DDB_BY={d}", .{ d.blk_x, d.blk_y }) catch unreachable
         else
             "";
-        const opts = try std.fmt.allocPrintSentinel(allocator, "-cl-std=CL1.2 -DITER={d} -DGRAIN_ON={d} -DBITS={d} -DHALF={d} -DDITHERK={d} -DDMODE={d}{s}", .{ d.iterations, @intFromBool(d.grain_on), d.bits, @intFromBool(d.half), @intFromBool(d.dither_on), d.dmode, blk_opt }, 0);
-        defer allocator.free(opts);
-        self.program.build(&.{d.device}, opts) catch |err| {
-            if (err == error.BuildProgramFailure) {
-                const log = try self.program.getBuildLog(allocator, d.device);
-                defer allocator.free(log);
-                std.log.err("Deband OpenCL build failed: {s}", .{log});
-            }
-            return err;
-        };
+        for (0..d.n_prog) |m| {
+            self.programs[m] = try cl.createProgramWithSource(d.context, deband_src);
+            self.n_prog = m + 1;
+            const opts = try std.fmt.allocPrintSentinel(allocator, "-cl-std=CL1.2 -DITER={d} -DGRAIN_ON={d} -DBITS={d} -DHALF={d} -DDITHERK={d} -DDMODE={d}{s}", .{ d.prog_iter[m], @intFromBool(d.prog_grain[m]), d.bits, @intFromBool(d.half), @intFromBool(d.dither_on), d.dmode, blk_opt }, 0);
+            defer allocator.free(opts);
+            self.programs[m].build(&.{d.device}, opts) catch |err| {
+                if (err == error.BuildProgramFailure) {
+                    const log = try self.programs[m].getBuildLog(allocator, d.device);
+                    defer allocator.free(log);
+                    std.log.err("Deband OpenCL build failed: {s}", .{log});
+                }
+                return err;
+            };
+        }
 
         self.queue = try cl.createCommandQueue(d.context, d.device, .{});
         errdefer self.queue.release();
@@ -216,6 +246,23 @@ const Stream = struct {
         errdefer self.src.release();
         self.dst = try cl.createBuffer(u8, d.context, .{ .read_write = true }, d.buff_size * d.bytes);
         errdefer self.dst.release();
+
+        self.geom = try cl.createBuffer(i32, d.context, .{ .read_only = true }, 12);
+        errdefer self.geom.release();
+        {
+            var g: [12]i32 = @splat(0);
+            var r: usize = 0;
+            while (r < @as(usize, @intCast(d.n_proc))) : (r += 1) {
+                const p: usize = @intCast(d.rank_plane[r]);
+                g[r * 4 + 0] = d.pw[p];
+                g[r * 4 + 1] = d.ph[p];
+                g[r * 4 + 2] = d.pstride[p];
+                g[r * 4 + 3] = 0;
+            }
+            if (cl.c.clEnqueueWriteBuffer(self.queue.handle, self.geom.handle, cl.c.CL_TRUE, 0, 12 * @sizeOf(i32), &g, 0, null, null) != cl.c.CL_SUCCESS)
+                return error.EnqueueWrite;
+        }
+
         if (d.dlut != null)
             self.dlut = try cl.createBuffer(f32, d.context, .{ .read_only = true }, dlut_len);
         errdefer if (self.dlut) |b| b.release();
@@ -224,42 +271,56 @@ const Stream = struct {
                 return error.EnqueueWrite;
         }
 
-        errdefer self.releaseKernels();
-        var r: usize = 0;
-        while (r < @as(usize, @intCast(d.n_proc))) : (r += 1) {
-            const p: usize = @intCast(d.rank_plane[r]);
-            const dith = r == 0 and d.dither_on;
-            const k = try cl.createKernel(self.program, if (dith) "deband_d" else "deband");
-            self.kernels[r] = k;
-            errdefer k.release();
-            try k.setArg(@TypeOf(self.dst), 0, self.dst);
-            try k.setArg(@TypeOf(self.src), 1, self.src);
-            try k.setArg(c_int, 2, d.pw[p]);
-            try k.setArg(c_int, 3, d.ph[p]);
-            try k.setArg(c_int, 4, d.pstride[p]);
-            try k.setArg(f32, 5, d.threshold_s);
-            try k.setArg(f32, 6, d.radius);
-            try k.setArg(f32, 7, d.grain_s);
-            if (dith and self.dlut != null) try k.setArg(cl.Buffer(f32), 9, self.dlut.?);
-            self.n_kern = r + 1;
+        if (d.use_pinned) blk: {
+            const st = cl.createBuffer(u8, d.context, .{ .alloc_host_ptr = true }, 2 * d.buff_size * d.bytes) catch break :blk;
+            var map_err: cl.c.cl_int = cl.c.CL_SUCCESS;
+            const map_ptr = cl.c.clEnqueueMapBuffer(self.queue.handle, st.handle, cl.c.CL_TRUE, cl.c.CL_MAP_READ | cl.c.CL_MAP_WRITE, 0, 2 * d.buff_size * d.bytes, 0, null, null, &map_err);
+            if (map_err != cl.c.CL_SUCCESS or map_ptr == null) {
+                st.release();
+                std.log.warn("Deband: pinned staging unavailable; this stream runs pageable transfers.", .{});
+                break :blk;
+            }
+            self.stage = st;
+            self.host = @as([*]u8, @ptrCast(map_ptr.?))[0 .. 2 * d.buff_size * d.bytes];
         }
-    }
+        errdefer if (self.stage) |st| {
+            _ = cl.c.clEnqueueUnmapMemObject(self.queue.handle, st.handle, self.host.ptr, 0, null, null);
+            _ = cl.c.clFinish(self.queue.handle);
+            st.release();
+        };
 
-    fn releaseKernels(self: *Stream) void {
-        var i: usize = self.n_kern;
-        while (i > 0) {
-            i -= 1;
-            self.kernels[i].release();
+        errdefer {
+            var kk: usize = 0;
+            while (kk < self.n_kern) : (kk += 1) self.kerns[kk].release();
+        }
+        const nk: usize = if (d.fused) 1 else @intCast(d.n_proc);
+        for (0..nk) |r| {
+            const p: usize = @intCast(d.rank_plane[r]);
+            self.kerns[r] = try cl.createKernel(self.programs[d.plane_prog[p]], "deband");
+            self.n_kern = r + 1;
+            try self.kerns[r].setArg(@TypeOf(self.dst), 0, self.dst);
+            try self.kerns[r].setArg(@TypeOf(self.src), 1, self.src);
+            try self.kerns[r].setArg(@TypeOf(self.geom), 2, self.geom);
+            try self.kerns[r].setArg(f32, 3, d.threshold_s[p]);
+            try self.kerns[r].setArg(f32, 4, d.radius[p]);
+            try self.kerns[r].setArg(f32, 5, d.grain_s[p]);
+            if (self.dlut != null) try self.kerns[r].setArg(cl.Buffer(f32), 7, self.dlut.?);
         }
     }
 
     pub fn deinit(self: *Stream) void {
-        self.releaseKernels();
+        if (self.stage) |st| _ = cl.c.clEnqueueUnmapMemObject(self.queue.handle, st.handle, self.host.ptr, 0, null, null);
+        _ = cl.c.clFinish(self.queue.handle);
+        var kk: usize = 0;
+        while (kk < self.n_kern) : (kk += 1) self.kerns[kk].release();
         if (self.dlut) |b| b.release();
+        if (self.stage) |st| st.release();
+        self.geom.release();
         self.dst.release();
         self.src.release();
         self.queue.release();
-        self.program.release();
+        var m: usize = 0;
+        while (m < self.n_prog) : (m += 1) self.programs[m].release();
     }
 };
 
@@ -385,103 +446,133 @@ const deband_src =
     \\}
     \\
     \\kernel __attribute__((reqd_work_group_size(DB_BX, DB_BY, 1)))
-    \\void deband(global io_t *dst, global const io_t *src,
-    \\            int W, int H, int STRIDE,
-    \\            float threshold, float radius, float grain, uint zseed) {
+    \\void deband(global io_t *dst, global const io_t *src, global const int *geom,
+    \\            float threshold, float radius, float grain, uint zbase
+    \\#if DITHERK && (DMODE == 0 || DMODE == 1)
+    \\            , global const float *dlut
+    \\#endif
+    \\            ) {
+    \\    const int z = get_global_id(2);
+    \\    const int W = geom[z * 4], H = geom[z * 4 + 1];
+    \\    const int STRIDE = geom[z * 4 + 2];
     \\    const int gx = get_global_id(0);
     \\    const int gy = get_global_id(1);
     \\    if (gx >= W || gy >= H) return;
-    \\    float res = db_core(src, W, H, STRIDE, threshold, radius, grain, zseed, gx, gy);
-    \\    // f32: plain store; f16: vstore_half_rtz (the MEASURED r16f RT store — not rte);
-    \\    // u8/u16: the measured NVIDIA UNORM store (db_store8/16).
-    \\    STOREI(dst, gy * STRIDE + gx, res);
-    \\}
+    \\    long OFF = 0;
+    \\    for (int r = 0; r < z; ++r) OFF += (long)geom[r * 4 + 1] * (long)geom[r * 4 + 2];
+    \\    global const io_t *srcp = src + OFF;
+    \\    global io_t *dstp = dst + OFF;
+    \\    const uint zseed = (zbase + (uint)z) & 0xFFu;
+    \\    float res = db_core(srcp, W, H, STRIDE, threshold, radius, grain, zseed, gx, gy);
     \\
     \\#if DITHERK
-    \\kernel __attribute__((reqd_work_group_size(DB_BX, DB_BY, 1)))
-    \\void deband_d(global io_t *dst, global const io_t *src,
-    \\              int W, int H, int STRIDE,
-    \\              float threshold, float radius, float grain, uint zseed
+    \\    if (z == 0) {
+    \\        float bias;
     \\#if DMODE == 0 || DMODE == 1
-    \\              , global const float *dlut   // absent for the ALU modes: every declared
-    \\#endif                                     // arg must be set or enqueue fails
-    \\              ) {
-    \\    const int gx = get_global_id(0);
-    \\    const int gy = get_global_id(1);
-    \\    if (gx >= W || gy >= H) return;
-    \\    float res = db_core(src, W, H, STRIDE, threshold, radius, grain, zseed, gx, gy);
-    \\
-    \\    float bias;
-    \\#if DMODE == 0 || DMODE == 1
-    \\    // fract((x+0.5)/64)*64 -> ivec2 truncation == (x%64, y%64), exact in f32 (x < 2^22).
-    \\    bias = dlut[((gy & 63) << 6) | (gx & 63)];
+    \\        bias = dlut[((gy & 63) << 6) | (gx & 63)];
     \\#elif DMODE == 2
-    \\    // PL_DITHER_ORDERED_FIXED: 16x16 morton + bitwise reversal, verbatim.
-    \\    uint bx = ((uint)gx & 15u) ^ ((uint)gy & 15u);    // uvec2(pos*16.0)%16; xy.x ^= xy.y
-    \\    uint by = (uint)gy & 15u;
-    \\    bx = (bx | (bx << 2)) & 0x33333333u;
-    \\    by = (by | (by << 2)) & 0x33333333u;
-    \\    bx = (bx | (bx << 1)) & 0x55555555u;
-    \\    by = (by | (by << 1)) & 0x55555555u;
-    \\    uint b = bx + (by << 1);
-    \\    b = (b * 0x0802u & 0x22110u) | (b * 0x8020u & 0x88440u);
-    \\    b = 0x10101u * b;
-    \\    b = (b >> 16) & 0xFFu;
-    \\    bias = convert_float(b) * (1.0f / 256.0f);
+    \\        uint bx = ((uint)gx & 15u) ^ ((uint)gy & 15u);
+    \\        uint by = (uint)gy & 15u;
+    \\        bx = (bx | (bx << 2)) & 0x33333333u;
+    \\        by = (by | (by << 2)) & 0x33333333u;
+    \\        bx = (bx | (bx << 1)) & 0x55555555u;
+    \\        by = (by | (by << 1)) & 0x55555555u;
+    \\        uint b = bx + (by << 1);
+    \\        b = (b * 0x0802u & 0x22110u) | (b * 0x8020u & 0x88440u);
+    \\        b = 0x10101u * b;
+    \\        b = (b >> 16) & 0xFFu;
+    \\        bias = convert_float(b) * (1.0f / 256.0f);
     \\#else
-    \\    // PL_DITHER_WHITE_NOISE: sh_prng makes a FRESH state per call; temporal=false -> z=0.
-    \\    uint3 ws = db_pcg3d((uint3)((uint)gx, (uint)gy, 0u));
-    \\    bias = convert_float(ws.x) * INV_U32;
+    \\        uint3 ws = db_pcg3d((uint3)((uint)gx, (uint)gy, 0u));
+    \\        bias = convert_float(ws.x) * INV_U32;
+    \\#endif
+    \\        res = (fabs(res) < 1e-5f) ? 0.0f : res;
+    \\        float q = floor(255.0f * res + bias);
+    \\        dstp[gy * STRIDE + gx] = convert_uchar_sat(q);
+    \\        return;
+    \\    }
     \\#endif
     \\
-    \\    res = (fabs(res) < 1e-5f) ? 0.0f : res;           // don't lift true black off zero
-    \\    float q = floor(255.0f * res + bias);             // scale*color + bias; floor
-    \\    // (q/255)*255 rounds back to exactly q for q in [0,255], so store q directly;
-    \\    // _sat replicates the UNORM store clamp (grain can push res slightly past 1.0).
-    \\    dst[gy * STRIDE + gx] = convert_uchar_sat(q);
+    \\    STOREI(dstp, gy * STRIDE + gx, res);
     \\}
-    \\#endif
 ;
 
 const ndr = vszipcl.ndr;
-fn writeBuf(s: *Stream, buf: cl.Buffer(u8), src: []const u8) !void {
-    return vszipcl.enqWrite(s.queue, buf.handle, 0, src);
-}
-fn readBuf(s: *Stream, buf: cl.Buffer(u8), dst: []u8) !void {
-    return vszipcl.enqRead(s.queue, buf.handle, 0, dst);
-}
 
 const ZFrame = @typeInfo(@TypeOf(ZAPI.initZFrame)).@"fn".return_type.?;
 const ZFrameW = @typeInfo(@TypeOf(ZFrame.newVideoFrame)).@"fn".return_type.?;
 
+fn enqueueDeband(d: *Data, s: *Stream) !void {
+    const lws: [3]usize = .{ d.blk_x, d.blk_y, 1 };
+    if (d.fused) {
+        const gws: [3]usize = .{ vszipcl.ceilTo(d.gws_w, d.blk_x), vszipcl.ceilTo(d.gws_h, d.blk_y), @intCast(d.n_proc) };
+        try ndr(s, s.kerns[0], &gws, &lws);
+    } else {
+        for (0..@as(usize, @intCast(d.n_proc))) |r| {
+            const p: usize = @intCast(d.rank_plane[r]);
+            const off: [3]usize = .{ 0, 0, r };
+            const gws: [3]usize = .{ vszipcl.ceilTo(@intCast(d.pw[p]), d.blk_x), vszipcl.ceilTo(@intCast(d.ph[p]), d.blk_y), 1 };
+            if (cl.c.clEnqueueNDRangeKernel(s.queue.handle, s.kerns[r].handle, 3, &off, &gws, &lws, 0, null, null) != cl.c.CL_SUCCESS)
+                return error.EnqueueKernel;
+        }
+    }
+}
+
 fn process(d: *Data, s: *Stream, src: ZFrame, dst: ZFrameW, n: c_int) !void {
     errdefer _ = cl.c.clFinish(s.queue.handle);
 
+    if (d.n_proc == 0) return;
+
     const num_planes: u32 = @intCast(d.vi.format.numPlanes);
-    var p: u32 = 0;
-    while (p < num_planes) : (p += 1) {
-        if (!d.process[p]) continue;
+    const span: usize = d.buff_size * d.bytes;
 
-        const srcp = src.getReadSlice(p);
-        const dstp = dst.getWriteSlice(p);
-        const w: usize = @intCast(d.pw[p]);
-        const h: usize = @intCast(d.ph[p]);
-        const stride: usize = @intCast(d.pstride[p]);
-        std.debug.assert(srcp.len == h * stride * d.bytes and dstp.len == srcp.len);
+    const zbase: c_uint = @intCast(@mod(@as(i64, n) * @as(i64, d.n_proc), 256));
+    for (0..s.n_kern) |kk| try s.kerns[kk].setArg(c_uint, 6, zbase);
 
-        try writeBuf(s, s.src, srcp);
-        const z: c_uint = @intCast((@as(i64, n) * @as(i64, d.n_proc) + @as(i64, d.rank[p])) & 0xFF);
-        const k = s.kernels[@intCast(d.rank[p])];
-        try k.setArg(c_uint, 8, z);
-
-        const lws: [2]usize = .{ d.blk_x, d.blk_y };
-        const gws: [2]usize = .{ vszipcl.ceilTo(w, d.blk_x), vszipcl.ceilTo(h, d.blk_y) };
-        try ndr(s, k, &gws, &lws);
-
-        try readBuf(s, s.dst, dstp);
+    if (s.stage != null) {
+        d.memcpy_sem.waitUncancelable(vszipcl.io);
+        var p: u32 = 0;
+        while (p < num_planes) : (p += 1) {
+            if (!d.process[p]) continue;
+            const srcp = src.getReadSlice(p);
+            if (srcp.len != @as(usize, @intCast(d.ph[p])) * @as(usize, @intCast(d.pstride[p])) * d.bytes) {
+                d.memcpy_sem.post(vszipcl.io);
+                return error.PlaneLayoutMismatch;
+            }
+            @memcpy(s.host[d.off_reg[p] * d.bytes ..][0..srcp.len], srcp);
+        }
+        d.memcpy_sem.post(vszipcl.io);
+        try vszipcl.enqWrite(s.queue, s.src.handle, 0, s.host[0..span]);
+        try enqueueDeband(d, s);
+        try vszipcl.enqRead(s.queue, s.dst.handle, 0, s.host[span..][0..span]);
+    } else {
+        var p: u32 = 0;
+        while (p < num_planes) : (p += 1) {
+            if (!d.process[p]) continue;
+            const srcp = src.getReadSlice(p);
+            std.debug.assert(srcp.len == @as(usize, @intCast(d.ph[p])) * @as(usize, @intCast(d.pstride[p])) * d.bytes);
+            try vszipcl.enqWrite(s.queue, s.src.handle, d.off_reg[p] * d.bytes, srcp);
+        }
+        try enqueueDeband(d, s);
+        p = 0;
+        while (p < num_planes) : (p += 1) {
+            if (!d.process[p]) continue;
+            try vszipcl.enqRead(s.queue, s.dst.handle, d.off_reg[p] * d.bytes, dst.getWriteSlice(p));
+        }
     }
 
     if (cl.c.clFinish(s.queue.handle) != cl.c.CL_SUCCESS) return error.Finish;
+
+    if (s.stage != null) {
+        d.memcpy_sem.waitUncancelable(vszipcl.io);
+        var p: u32 = 0;
+        while (p < num_planes) : (p += 1) {
+            if (!d.process[p]) continue;
+            const dstp = dst.getWriteSlice(p);
+            @memcpy(dstp, s.host[span + d.off_reg[p] * d.bytes ..][0..dstp.len]);
+        }
+        d.memcpy_sem.post(vszipcl.io);
+    }
 }
 
 fn getFrame(n: c_int, activation_reason: vs.ActivationReason, instance_data: ?*anyopaque, _: ?*?*anyopaque, frame_ctx: ?*vs.FrameContext, core: ?*vs.Core, vsapi: ?*const vs.API) callconv(.c) ?*const vs.Frame {
@@ -494,6 +585,7 @@ fn getFrame(n: c_int, activation_reason: vs.ActivationReason, instance_data: ?*a
         const src = zapi.initZFrame(d.node, n);
         defer src.deinit();
         const dst = src.newVideoFrame();
+
         const num_planes: u32 = @intCast(d.vi.format.numPlanes);
         var p: u32 = 0;
         while (p < num_planes) : (p += 1) {
@@ -531,8 +623,10 @@ pub fn create(in: ?*const vs.Map, out: ?*vs.Map, _: ?*anyopaque, core: ?*vs.Core
     const map_out = zapi.initZMap(out);
 
     d.node, d.vi = map_in.getNodeVi("clip").?;
+
     var keep = false;
     defer if (!keep) zapi.freeNode(d.node);
+
     const fmt = d.vi.format;
     const bits: i32 = fmt.bitsPerSample;
     const depth_ok = (fmt.sampleType == .Float and (bits == 32 or bits == 16)) or
@@ -544,14 +638,21 @@ pub fn create(in: ?*const vs.Map, out: ?*vs.Map, _: ?*anyopaque, core: ?*vs.Core
     d.half = fmt.sampleType == .Float and bits == 16;
     d.bytes = @intCast(fmt.bytesPerSample);
 
-    const iterations = map_in.getValue(i32, "iterations") orelse 1;
-    if (iterations < 0 or iterations > max_iterations) return map_out.setError("Deband: iterations must be 0..32.");
-    const threshold = map_in.getValue(f32, "threshold") orelse 3.0;
-    if (!math.isFinite(threshold) or threshold < 0.0) return map_out.setError("Deband: threshold must be a finite value >= 0.");
-    const radius = map_in.getValue(f32, "radius") orelse 16.0;
-    if (!math.isFinite(radius) or radius < 0.0) return map_out.setError("Deband: radius must be a finite value >= 0.");
-    const grain = map_in.getValue(f32, "grain") orelse 4.0;
-    if (!math.isFinite(grain) or grain < 0.0) return map_out.setError("Deband: grain must be a finite value >= 0.");
+    var iterations: [3]i32 = undefined;
+    var threshold: [3]f32 = undefined;
+    var radius: [3]f32 = undefined;
+    var grain: [3]f32 = undefined;
+    for (0..3) |i| {
+        iterations[i] = map_in.getValue2(i32, "iterations", i) orelse if (i > 0) iterations[i - 1] else 1;
+        threshold[i] = map_in.getValue2(f32, "threshold", i) orelse if (i > 0) threshold[i - 1] else 3.0;
+        radius[i] = map_in.getValue2(f32, "radius", i) orelse if (i > 0) radius[i - 1] else 16.0;
+        grain[i] = map_in.getValue2(f32, "grain", i) orelse if (i > 0) grain[i - 1] else 4.0;
+
+        if (iterations[i] < 0 or iterations[i] > max_iterations) return map_out.setError("Deband: iterations must be 0..32.");
+        if (!math.isFinite(threshold[i]) or threshold[i] < 0.0) return map_out.setError("Deband: threshold must be a finite value >= 0.");
+        if (!math.isFinite(radius[i]) or radius[i] < 0.0) return map_out.setError("Deband: radius must be a finite value >= 0.");
+        if (!math.isFinite(grain[i]) or grain[i] < 0.0) return map_out.setError("Deband: grain must be a finite value >= 0.");
+    }
 
     var sel = [3]bool{ true, true, true };
     if (map_in.numElements("planes")) |ne| {
@@ -575,11 +676,13 @@ pub fn create(in: ?*const vs.Map, out: ?*vs.Map, _: ?*anyopaque, core: ?*vs.Core
     const ns_req = map_in.getValue(i32, "num_streams");
     if (ns_req) |ns| if (ns < 1 or ns > 32) return map_out.setError("Deband: num_streams must be 1..32.");
 
-    d.iterations = iterations;
-    d.threshold_s = threshold / 1000.0;
-    d.radius = radius;
-    d.grain_s = grain / 1000.0;
-    d.grain_on = grain > 0.0;
+    for (0..3) |i| {
+        d.iterations[i] = iterations[i];
+        d.threshold_s[i] = threshold[i] / 1000.0;
+        d.radius[i] = radius[i];
+        d.grain_s[i] = grain[i] / 1000.0;
+        d.grain_on[i] = grain[i] > 0.0;
+    }
 
     const strides = vszipcl.strideFromVi(d.vi);
     const num_planes: usize = @intCast(fmt.numPlanes);
@@ -587,6 +690,9 @@ pub fn create(in: ?*const vs.Map, out: ?*vs.Map, _: ?*anyopaque, core: ?*vs.Core
     const subH: u5 = @intCast(fmt.subSamplingH);
     var np: i32 = 0;
     var pi: usize = 0;
+    var region_sum: usize = 0;
+    d.gws_w = 0;
+    d.gws_h = 0;
     while (pi < 3) : (pi += 1) {
         d.process[pi] = false;
         d.rank[pi] = -1;
@@ -594,6 +700,7 @@ pub fn create(in: ?*const vs.Map, out: ?*vs.Map, _: ?*anyopaque, core: ?*vs.Core
         d.pw[pi] = 0;
         d.ph[pi] = 0;
         d.pstride[pi] = 0;
+        d.off_reg[pi] = 0;
         if (pi >= num_planes) continue;
         d.pw[pi] = if (pi == 0) @intCast(d.vi.width) else @intCast(d.vi.width >> subW);
         d.ph[pi] = if (pi == 0) @intCast(d.vi.height) else @intCast(d.vi.height >> subH);
@@ -603,11 +710,51 @@ pub fn create(in: ?*const vs.Map, out: ?*vs.Map, _: ?*anyopaque, core: ?*vs.Core
             d.rank[pi] = np;
             d.rank_plane[@intCast(np)] = @intCast(pi);
             np += 1;
+            d.off_reg[pi] = region_sum;
+            region_sum += @as(usize, @intCast(d.ph[pi])) * @as(usize, @intCast(d.pstride[pi]));
+            d.gws_w = @max(d.gws_w, @as(usize, @intCast(d.pw[pi])));
+            d.gws_h = @max(d.gws_h, @as(usize, @intCast(d.ph[pi])));
         }
     }
     d.n_proc = np;
-    d.buff_size = @as(usize, @intCast(strides[0])) * @as(usize, @intCast(d.vi.height));
-    if (d.buff_size >= (1 << 31)) return map_out.setError("Deband: frame too large (a plane exceeds 2^31 samples).");
+    d.buff_size = @max(region_sum, 1);
+
+    d.fused = false;
+    if (np > 0) {
+        const p0: usize = @intCast(d.rank_plane[0]);
+        d.fused = true;
+        for (0..3) |i| {
+            if (!d.process[i]) continue;
+            if (iterations[i] != iterations[p0] or threshold[i] != threshold[p0] or
+                radius[i] != radius[p0] or grain[i] != grain[p0]) d.fused = false;
+        }
+    }
+    d.n_prog = 0;
+    d.plane_prog = .{ 0, 0, 0 };
+    for (0..3) |p| {
+        if (!d.process[p]) continue;
+        var hit: ?usize = null;
+        for (0..d.n_prog) |m| {
+            if (d.prog_iter[m] == d.iterations[p] and d.prog_grain[m] == d.grain_on[p]) hit = m;
+        }
+        if (hit) |m| {
+            d.plane_prog[p] = m;
+        } else {
+            d.prog_iter[d.n_prog] = d.iterations[p];
+            d.prog_grain[d.n_prog] = d.grain_on[p];
+            d.plane_prog[p] = d.n_prog;
+            d.n_prog += 1;
+        }
+    }
+
+    {
+        var gp: usize = 0;
+        while (gp < 3) : (gp += 1) {
+            if (d.process[gp] and @as(usize, @intCast(d.ph[gp])) * @as(usize, @intCast(d.pstride[gp])) >= (1 << 31))
+                return map_out.setError("Deband: frame too large (a plane exceeds 2^31 samples).");
+        }
+    }
+
     var chk: usize = 0;
     while (chk < 3) : (chk += 1)
         if (d.process[chk] and (d.pw[chk] <= 0 or d.ph[chk] <= 0)) return map_out.setError("Deband: a processed plane has zero size.");
@@ -631,16 +778,21 @@ pub fn create(in: ?*const vs.Map, out: ?*vs.Map, _: ?*anyopaque, core: ?*vs.Core
 
     d.blk_x = 16;
     d.blk_y = 8;
+    const streams: usize = if (ns_req) |ns| @intCast(ns) else 1;
+    d.use_pinned = streams >= 2;
     {
         var terr: ?[:0]const u8 = null;
         if (map_in.numElements("tune")) |n| {
-            if (n > tune_len) terr = "Deband: tune expects at most 2 entries [blk_x, blk_y].";
+            if (n > tune_len) terr = "Deband: tune expects at most 3 entries [blk_x, blk_y, pinned].";
         }
         if (vszipcl.tuneEntry(map_in, 0)) |v| {
             if (v < 1 or v > 64) terr = "Deband: tune[0] (blk_x) must be 1..64." else d.blk_x = @intCast(v);
         }
         if (vszipcl.tuneEntry(map_in, 1)) |v| {
             if (v < 1 or v > 64) terr = "Deband: tune[1] (blk_y) must be 1..64." else d.blk_y = @intCast(v);
+        }
+        if (vszipcl.tuneEntry(map_in, 2)) |v| {
+            if (v > 1) terr = "Deband: tune[2] (pinned) must be 0 or 1." else d.use_pinned = v != 0;
         }
         if (d.blk_x * d.blk_y > vszipcl.deviceMaxWG(d.device)) terr = "Deband: tune blk_x*blk_y exceeds the device max work-group size.";
         if (terr) |msg| {
@@ -650,12 +802,13 @@ pub fn create(in: ?*const vs.Map, out: ?*vs.Map, _: ?*anyopaque, core: ?*vs.Core
             return;
         }
     }
+
     d.pool = .{};
+    d.memcpy_sem = .{ .permits = if (streams <= 2) streams else 1 };
     const data: *Data = allocator.create(Data) catch unreachable;
     data.* = d;
     keep = true;
 
-    const streams: usize = if (ns_req) |ns| @intCast(ns) else 1;
     data.pool.prime(data, streams);
     data.pool.prewarm(streams) catch |err| {
         map_out.setError("Deband: OpenCL stream init failed.");
