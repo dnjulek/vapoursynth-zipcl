@@ -980,6 +980,9 @@ pub fn create(in: ?*const vs.Map, out: ?*vs.Map, _: ?*anyopaque, core: ?*vs.Core
 
     const device_id = map_in.getValue(i32, "device_id") orelse 0;
     if (device_id < 0) return map_out.setError("DFTTest: invalid device ID.");
+    const platform_id = map_in.getValue(i32, "platform_id") orelse 0;
+    if (platform_id < 0) return map_out.setError("Resample: invalid platform ID.");
+
     const ns_req = map_in.getValue(i32, "num_streams");
     if (ns_req) |ns| if (ns < 1 or ns > 32) {
         return map_out.setError("DFTTest: num_streams must be 1..32.");
@@ -1260,9 +1263,9 @@ pub fn create(in: ?*const vs.Map, out: ?*vs.Map, _: ?*anyopaque, core: ?*vs.Core
     d.stage_cap = tw * d.raw_elems * d.bytes;
     d.slot_bytes = d.slot_elems * d.bytes;
 
-    vszipcl.initContext(&d, @intCast(device_id)) catch |err| {
+    vszipcl.initContext(&d, @intCast(device_id), @intCast(platform_id),) catch |err| {
         freeTables(&d);
-        map_out.setError(if (err == error.InvalidDeviceID) "DFTTest: invalid device ID." else "DFTTest: OpenCL init failed.");
+        map_out.setError(if (err == error.InvalidDeviceID) "DFTTest: invalid device ID." else if (err == error.InvalidPlatformID) "DFTTest: invalid platform ID." else "DFTTest: OpenCL init failed.");
         std.log.err("DFTTest OpenCL init failed: {}", .{err});
         return;
     };

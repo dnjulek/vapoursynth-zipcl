@@ -673,6 +673,8 @@ pub fn create(in: ?*const vs.Map, out: ?*vs.Map, _: ?*anyopaque, core: ?*vs.Core
     d.dmode = dither_algo;
     const device_id = map_in.getValue(i32, "device_id") orelse 0;
     if (device_id < 0) return map_out.setError("Deband: invalid device ID.");
+    const platform_id = map_in.getValue(i32, "platform_id") orelse 0;
+    if (platform_id < 0) return map_out.setError("Deband: invalid platform ID.");
     const ns_req = map_in.getValue(i32, "num_streams");
     if (ns_req) |ns| if (ns < 1 or ns > 32) return map_out.setError("Deband: num_streams must be 1..32.");
 
@@ -769,8 +771,8 @@ pub fn create(in: ?*const vs.Map, out: ?*vs.Map, _: ?*anyopaque, core: ?*vs.Core
         d.dlut = lut;
     }
 
-    vszipcl.initContext(&d, @intCast(device_id)) catch |err| {
-        map_out.setError(if (err == error.InvalidDeviceID) "Deband: invalid device ID." else "Deband: OpenCL initialization failed.");
+    vszipcl.initContext(&d, @intCast(device_id), @intCast(platform_id)) catch |err| {
+        map_out.setError(if (err == error.InvalidDeviceID) "Deband: invalid device ID." else if (err == error.InvalidPlatformID) "Deband: invalid platform ID." else "Deband: OpenCL initialization failed.");
         std.log.err("Deband OpenCL init failed: {}", .{err});
         if (d.dlut) |lut| allocator.free(lut);
         return;

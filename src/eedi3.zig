@@ -1225,8 +1225,8 @@ fn stencilRow(yy: i32, sh: i32, dh: bool) i32 {
     return @intCast(if (dh) reflectRow(yy, 2 * sh) / 2 else reflectRow(yy, sh));
 }
 
-fn initOpenCL(d: *Data, device_id: usize) !void {
-    try vszipcl.initContext(d, device_id);
+fn initOpenCL(d: *Data, device_id: usize, platform_id: usize) !void {
+    try vszipcl.initContext(d, device_id, platform_id);
     var dev_max_wg: usize = 0;
     if (cl.c.clGetDeviceInfo(d.device.id, cl.c.CL_DEVICE_MAX_WORK_GROUP_SIZE, @sizeOf(usize), &dev_max_wg, null) == cl.c.CL_SUCCESS and dev_max_wg > 0) {
         d.max_wg = dev_max_wg;
@@ -1557,6 +1557,8 @@ fn createImpl(in: ?*const vs.Map, out: ?*vs.Map, _: ?*anyopaque, core_ptr: ?*vs.
     }
     const device_id = map_in.getValue(i32, "device_id") orelse 0;
     if (device_id < 0) return map_out.setError("EEDI3: invalid device ID.");
+    const platform_id = map_in.getValue(i32, "platform_id") orelse 0;
+    if (platform_id < 0) return map_out.setError("EEDI3: invalid platform ID.");
 
     if (field > 1) {
         if (d.vi.numFrames > std.math.maxInt(i32) / 2) return map_out.setError("EEDI3: clip too long.");
@@ -1699,8 +1701,8 @@ fn createImpl(in: ?*const vs.Map, out: ?*vs.Map, _: ?*anyopaque, core_ptr: ?*vs.
         }
     }
 
-    initOpenCL(&d, @intCast(device_id)) catch |err| {
-        map_out.setError(if (err == error.InvalidDeviceID) "EEDI3: invalid device ID." else "EEDI3: OpenCL init failed.");
+    initOpenCL(&d, @intCast(device_id), @intCast(platform_id)) catch |err| {
+        map_out.setError(if (err == error.InvalidDeviceID) "EEDI3: invalid device ID." else if (err == error.InvalidPlatformID) "EEDI3: invalid platform ID." else "EEDI3: OpenCL init failed.");
         std.log.err("EEDI3 OpenCL init failed: {}", .{err});
         freeStencilTables(&d);
         return;

@@ -20,23 +20,23 @@ pub const io: std.Io = std.Io.Threaded.global_single_threaded.io();
 
 pub const std_options: std.Options = .{ .log_level = .warn };
 
-const eedi3_sig = "clip:vnode;field:int;dh:int:opt;mdis:int:opt;nrad:int:opt;alpha:float:opt;beta:float:opt;gamma:float:opt;hp:int:opt;vcheck:int:opt;vthresh0:float:opt;vthresh1:float:opt;vthresh2:float:opt;sclip:vnode:opt;device_id:int:opt;num_streams:int:opt;tune:int[]:opt;";
+const eedi3_sig = "clip:vnode;field:int;dh:int:opt;mdis:int:opt;nrad:int:opt;alpha:float:opt;beta:float:opt;gamma:float:opt;hp:int:opt;vcheck:int:opt;vthresh0:float:opt;vthresh1:float:opt;vthresh2:float:opt;sclip:vnode:opt;device_id:int:opt;platform_id:int:opt;num_streams:int:opt;tune:int[]:opt;";
 
 export fn VapourSynthPluginInit2(plugin: *vs.Plugin, vspapi: *const vs.PLUGINAPI) void {
     ZAPI.Plugin.config("com.julek.vszipcl", "vszipcl", "VapourSynth Zig Image Process OpenCL", zon.version, plugin, vspapi);
-    ZAPI.Plugin.function("Bilateral", "clip:vnode;sigma_spatial:float[]:opt;sigma_color:float[]:opt;radius:int[]:opt;device_id:int:opt;num_streams:int:opt;use_shared_memory:int:opt;ref:vnode:opt;tune:int[]:opt;", "clip:vnode;", bilateral.create, plugin, vspapi);
-    ZAPI.Plugin.function("GaussBlur", "clip:vnode;sigma:float[]:opt;device_id:int:opt;num_streams:int:opt;tune:int[]:opt;", "clip:vnode;", gaussglur.create, plugin, vspapi);
+    ZAPI.Plugin.function("Bilateral", "clip:vnode;sigma_spatial:float[]:opt;sigma_color:float[]:opt;radius:int[]:opt;device_id:int:opt;platform_id:int:opt;num_streams:int:opt;use_shared_memory:int:opt;ref:vnode:opt;tune:int[]:opt;", "clip:vnode;", bilateral.create, plugin, vspapi);
+    ZAPI.Plugin.function("GaussBlur", "clip:vnode;sigma:float[]:opt;device_id:int:opt;platform_id:int:opt;num_streams:int:opt;tune:int[]:opt;", "clip:vnode;", gaussglur.create, plugin, vspapi);
     ZAPI.Plugin.function("EEDI3", eedi3_sig, "clip:vnode;", eedi3.createEEDI3, plugin, vspapi);
     ZAPI.Plugin.function("EEDI3H", eedi3_sig, "clip:vnode;", eedi3.createEEDI3H, plugin, vspapi);
-    ZAPI.Plugin.function("NLMeans", "clip:vnode;d:int:opt;a:int:opt;s:int:opt;h:float:opt;channels:data:opt;wmode:int:opt;wref:float:opt;rclip:vnode:opt;device_id:int:opt;num_streams:int:opt;tune:int[]:opt;", "clip:vnode;", nlmeans.create, plugin, vspapi);
-    ZAPI.Plugin.function("Deband", "clip:vnode;iterations:int[]:opt;threshold:float[]:opt;radius:float[]:opt;grain:float[]:opt;planes:int[]:opt;dither:int:opt;dither_algo:int:opt;device_id:int:opt;num_streams:int:opt;tune:int[]:opt;", "clip:vnode;", deband.create, plugin, vspapi);
+    ZAPI.Plugin.function("NLMeans", "clip:vnode;d:int:opt;a:int:opt;s:int:opt;h:float:opt;channels:data:opt;wmode:int:opt;wref:float:opt;rclip:vnode:opt;device_id:int:opt;platform_id:int:opt;num_streams:int:opt;tune:int[]:opt;", "clip:vnode;", nlmeans.create, plugin, vspapi);
+    ZAPI.Plugin.function("Deband", "clip:vnode;iterations:int[]:opt;threshold:float[]:opt;radius:float[]:opt;grain:float[]:opt;planes:int[]:opt;dither:int:opt;dither_algo:int:opt;device_id:int:opt;platform_id:int:opt;num_streams:int:opt;tune:int[]:opt;", "clip:vnode;", deband.create, plugin, vspapi);
     ZAPI.Plugin.function(
         "Resample",
         "clip:vnode;width:int;height:int;filter:data:opt;clamp:float:opt;blur:float:opt;" ++
             "taper:float:opt;radius:float:opt;param1:float:opt;param2:float:opt;" ++
             "src_width:float:opt;src_height:float:opt;sx:float:opt;sy:float:opt;antiring:float:opt;" ++
             "sigmoidize:int:opt;sigmoid_center:float:opt;sigmoid_slope:float:opt;linearize:int:opt;trc:int:opt;" ++
-            "min_luma:float:opt;device_id:int:opt;num_streams:int:opt;tune:int[]:opt;",
+            "min_luma:float:opt;device_id:int:opt;platform_id:int:opt;num_streams:int:opt;tune:int[]:opt;",
         "clip:vnode;",
         resample.create,
         plugin,
@@ -48,7 +48,7 @@ export fn VapourSynthPluginInit2(plugin: *vs.Plugin, vspapi: *const vs.PLUGINAPI
             "pmax:float:opt;sbsize:int:opt;sosize:int:opt;tbsize:int:opt;swin:int:opt;" ++
             "twin:int:opt;sbeta:float:opt;tbeta:float:opt;zmean:int:opt;f0beta:float:opt;" ++
             "slocation:float[]:opt;ssx:float[]:opt;ssy:float[]:opt;sst:float[]:opt;" ++
-            "ssystem:int:opt;planes:int[]:opt;device_id:int:opt;num_streams:int:opt;tune:int[]:opt;",
+            "ssystem:int:opt;planes:int[]:opt;device_id:int:opt;platform_id:int:opt;num_streams:int:opt;tune:int[]:opt;",
         "clip:vnode;",
         dfttest.create,
         plugin,
@@ -56,7 +56,7 @@ export fn VapourSynthPluginInit2(plugin: *vs.Plugin, vspapi: *const vs.PLUGINAPI
     );
     const bm3d_sig = "clip:vnode;ref:vnode:opt;sigma:float[]:opt;block_step:int[]:opt;" ++
         "bm_range:int[]:opt;radius:int:opt;ps_num:int[]:opt;ps_range:int[]:opt;" ++
-        "chroma:int:opt;device_id:int:opt;num_streams:int:opt;" ++
+        "chroma:int:opt;device_id:int:opt;platform_id:int:opt;num_streams:int:opt;" ++
         "extractor_exp:int:opt;bm_error_s:data[]:opt;transform_2d_s:data[]:opt;" ++
         "transform_1d_s:data[]:opt;zero_init:int:opt;fast_fused:int:opt;tune:int[]:opt;";
     ZAPI.Plugin.function("BM3D", bm3d_sig, "clip:vnode;", bm3d.create, plugin, vspapi);
@@ -71,12 +71,13 @@ export fn VapourSynthPluginInit2(plugin: *vs.Plugin, vspapi: *const vs.PLUGINAPI
     );
 }
 
-pub fn initContext(d: anytype, device_id: usize) !void {
+pub fn initContext(d: anytype, device_id: usize, platform_id: usize) !void {
     const a = std.heap.c_allocator;
     const platforms = try cl.getPlatforms(a);
     defer a.free(platforms);
     if (platforms.len == 0) return error.NoPlatforms;
-    const platform = platforms[0];
+    if (platform_id >= platforms.len) return error.InvalidPlatformID;
+    const platform = platforms[platform_id];
     const devices = try platform.getDevices(a, cl.DeviceType.all);
     defer a.free(devices);
     if (devices.len == 0) return error.NoDevices;
