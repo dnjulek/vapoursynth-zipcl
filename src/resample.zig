@@ -1015,6 +1015,13 @@ const Data = struct {
     blk_x: usize,
     blk_y: usize,
 
+    use_pinned: bool,
+    stage_src_off: [3]usize,
+    stage_dst_off: [3]usize,
+    stage_src_sum: usize,
+    stage_bytes: usize,
+    memcpy_sem: std.Io.Semaphore,
+
     pool: clpool.Pool(Stream, Data),
 };
 
@@ -1026,6 +1033,8 @@ const Stream = struct {
     d_tmp1: ?cl.Buffer(u8),
     d_tmp2: ?cl.Buffer(u8),
     d_dst: cl.Buffer(u8),
+    stage: ?cl.Buffer(u8),
+    host: []u8,
     luts: [4]cl.Buffer(f32),
     n_lut: usize,
     kerns: [8]cl.Kernel,
@@ -1046,6 +1055,7 @@ const Stream = struct {
         self.n_kern = 0;
         self.d_tmp1 = null;
         self.d_tmp2 = null;
+        self.stage = null;
 
         errdefer {
             var m: usize = 0;
@@ -1070,6 +1080,25 @@ const Stream = struct {
         errdefer self.d_src.release();
         self.d_dst = try cl.createBuffer(u8, d.context, .{ .read_write = true }, d.dst_bytes);
         errdefer self.d_dst.release();
+
+        if (d.use_pinned) blk: {
+            const st = cl.createBuffer(u8, d.context, .{ .alloc_host_ptr = true }, d.stage_bytes) catch break :blk;
+            var map_err: cl.c.cl_int = cl.c.CL_SUCCESS;
+            const map_ptr = cl.c.clEnqueueMapBuffer(self.queue.handle, st.handle, cl.c.CL_TRUE, cl.c.CL_MAP_READ | cl.c.CL_MAP_WRITE, 0, d.stage_bytes, 0, null, null, &map_err);
+            if (map_err != cl.c.CL_SUCCESS or map_ptr == null) {
+                st.release();
+                std.log.warn("Resample: pinned staging unavailable; this stream runs pageable transfers.", .{});
+                break :blk;
+            }
+            self.stage = st;
+            self.host = @as([*]u8, @ptrCast(map_ptr.?))[0..d.stage_bytes];
+        }
+        errdefer if (self.stage) |st| {
+            _ = cl.c.clEnqueueUnmapMemObject(self.queue.handle, st.handle, self.host.ptr, 0, null, null);
+            _ = cl.c.clFinish(self.queue.handle);
+            st.release();
+        };
+
         if (d.prep) self.d_tmp1 = try cl.createBuffer(u8, d.context, .{ .read_write = true }, d.src_bytes);
         errdefer if (self.d_tmp1) |b| b.release();
         if (!d.polar) self.d_tmp2 = try cl.createBuffer(u8, d.context, .{ .read_write = true }, d.tmp2_bytes);
@@ -1147,11 +1176,13 @@ const Stream = struct {
     }
 
     pub fn deinit(self: *Stream) void {
+        if (self.stage) |st| _ = cl.c.clEnqueueUnmapMemObject(self.queue.handle, st.handle, self.host.ptr, 0, null, null);
         _ = cl.c.clFinish(self.queue.handle);
         var i: usize = 0;
         while (i < self.n_kern) : (i += 1) self.kerns[i].release();
         i = 0;
         while (i < self.n_lut) : (i += 1) self.luts[i].release();
+        if (self.stage) |st| st.release();
         if (self.d_tmp2) |b| b.release();
         if (self.d_tmp1) |b| b.release();
         self.d_dst.release();
@@ -1173,17 +1204,45 @@ fn process(d: *Data, s: *Stream, src: ZFrame, dst: ZFrameW) !void {
     const lws: [2]usize = .{ d.blk_x, d.blk_y };
     for (0..d.n_planes) |p| {
         const cfgi = d.plane_cfg[p];
+        const c = &d.cfgs[cfgi];
         const srcp = src.getReadSlice(@intCast(p));
-        try vszipcl.enqWrite(s.queue, s.d_src.handle, 0, srcp);
+        const dstp = dst.getWriteSlice(@intCast(p));
+
+        if (s.stage != null) {
+            const src_region = @as(usize, @intCast(c.sh)) * @as(usize, @intCast(c.sstride)) * d.bytes;
+            const dst_region = @as(usize, @intCast(c.dh)) * @as(usize, @intCast(c.dstride)) * d.bytes;
+            if (srcp.len != src_region or dstp.len != dst_region) return error.PlaneLayoutMismatch;
+            d.memcpy_sem.waitUncancelable(vszipcl.io);
+            @memcpy(s.host[d.stage_src_off[p]..][0..srcp.len], srcp);
+            d.memcpy_sem.post(vszipcl.io);
+            try vszipcl.enqWrite(s.queue, s.d_src.handle, 0, s.host[d.stage_src_off[p]..][0..srcp.len]);
+        } else {
+            try vszipcl.enqWrite(s.queue, s.d_src.handle, 0, srcp);
+        }
+
         const off = s.launch_off[cfgi];
         for (0..s.n_launch[cfgi]) |k| {
             const L = s.launches[off + k];
             const gws: [2]usize = .{ vszipcl.ceilTo(L.gw, d.blk_x), vszipcl.ceilTo(L.gh, d.blk_y) };
             try ndr(s, L.kern, &gws, &lws);
         }
-        try vszipcl.enqRead(s.queue, s.d_dst.handle, 0, dst.getWriteSlice(@intCast(p)));
+
+        if (s.stage != null) {
+            try vszipcl.enqRead(s.queue, s.d_dst.handle, 0, s.host[d.stage_src_sum + d.stage_dst_off[p] ..][0..dstp.len]);
+        } else {
+            try vszipcl.enqRead(s.queue, s.d_dst.handle, 0, dstp);
+        }
     }
     if (cl.c.clFinish(s.queue.handle) != cl.c.CL_SUCCESS) return error.Finish;
+
+    if (s.stage != null) {
+        d.memcpy_sem.waitUncancelable(vszipcl.io);
+        for (0..d.n_planes) |q| {
+            const dstp = dst.getWriteSlice(@intCast(q));
+            @memcpy(dstp, s.host[d.stage_src_sum + d.stage_dst_off[q] ..][0..dstp.len]);
+        }
+        d.memcpy_sem.post(vszipcl.io);
+    }
 }
 
 fn getFrame(n: c_int, activation_reason: vs.ActivationReason, instance_data: ?*anyopaque, _: ?*?*anyopaque, frame_ctx: ?*vs.FrameContext, core: ?*vs.Core, vsapi: ?*const vs.API) callconv(.c) ?*const vs.Frame {
@@ -1805,6 +1864,22 @@ pub fn create(in: ?*const vs.Map, out: ?*vs.Map, _: ?*anyopaque, core: ?*vs.Core
         allocator.free(cfg.opts);
         cfg.opts = with_blk;
     }
+
+    d.stage_src_sum = 0;
+    for (0..d.n_planes) |p| {
+        d.stage_src_off[p] = d.stage_src_sum;
+        const c = &d.cfgs[d.plane_cfg[p]];
+        d.stage_src_sum += @as(usize, @intCast(c.sh)) * @as(usize, @intCast(c.sstride)) * d.bytes;
+    }
+    var dst_sum: usize = 0;
+    for (0..d.n_planes) |p| {
+        d.stage_dst_off[p] = dst_sum;
+        const c = &d.cfgs[d.plane_cfg[p]];
+        dst_sum += @as(usize, @intCast(c.dh)) * @as(usize, @intCast(c.dstride)) * d.bytes;
+    }
+    d.stage_bytes = @max(d.stage_src_sum + dst_sum, 1);
+    d.use_pinned = streams >= 2 and dst_sum <= d.stage_src_sum;
+    d.memcpy_sem = .{ .permits = if (streams <= 2 or d.n_planes > 1) streams else 1 };
 
     const data: *Data = allocator.create(Data) catch unreachable;
     data.* = d;
