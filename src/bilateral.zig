@@ -652,6 +652,8 @@ pub fn create(in: ?*const vs.Map, out: ?*vs.Map, _: ?*anyopaque, core: ?*vs.Core
 
     const device_id = map_in.getValue(i32, "device_id") orelse 0;
     if (device_id < 0) return map_out.setError("Bilateral: invalid device ID.");
+    const platform_id = map_in.getValue(i32, "platform_id") orelse 0;
+    if (platform_id < 0) return map_out.setError("Bilateral: invalid platform ID.");
 
     const ns_req = map_in.getValue(i32, "num_streams"); // ?i32; null -> 1 (single stream)
     if (ns_req) |ns| if (ns < 1 or ns > 32) {
@@ -685,8 +687,8 @@ pub fn create(in: ?*const vs.Map, out: ?*vs.Map, _: ?*anyopaque, core: ?*vs.Core
         d.buff_stage = @max(1, off);
     }
 
-    vszipcl.initContext(&d, @intCast(device_id)) catch |err| {
-        map_out.setError(if (err == error.InvalidDeviceID) "Bilateral: invalid device ID." else "Bilateral: OpenCL initialization failed.");
+    vszipcl.initContext(&d, @intCast(device_id), @intCast(platform_id)) catch |err| {
+        map_out.setError(if (err == error.InvalidDeviceID) "Bilateral: invalid device ID." else if (err == error.InvalidPlatformID) "Bilateral: invalid platform ID." else "Bilateral: OpenCL initialization failed.");
         std.log.err("Bilateral OpenCL init failed: {}", .{err});
         return;
     };

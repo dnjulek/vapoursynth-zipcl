@@ -7,7 +7,7 @@ reference, verified bit-exact where the reference allows, and shares one fast ar
 actually scales on the GPU).
 
 All filters accept **8/16-bit integer, 16-bit half, and 32-bit float** input and are
-**multi-plane** (Gray / YUV / RGB, subsampled chroma). Every filter also takes `device_id`
+**multi-plane** (Gray / YUV / RGB, subsampled chroma). Every filter also takes `device_id`, `platform_id`
 and `num_streams`.
 
 [READ THE DOCS](https://github.com/dnjulek/vapoursynth-zipcl/wiki)
